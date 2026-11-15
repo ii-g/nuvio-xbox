@@ -8,7 +8,7 @@ using Windows.Storage;
 namespace Nuvio.Services
 {
     /// <summary>
-    /// The 29 settings keys (core/store.js DEFAULT_SETTINGS), stored as one JSON object in
+    /// The 30 settings keys (core/store.js DEFAULT_SETTINGS), stored as one JSON object in
     /// LocalSettings["settings"]. Unknown stored keys are kept, as in store.js.
     /// </summary>
     internal sealed class AppSettings
@@ -56,6 +56,7 @@ namespace Nuvio.Services
             defaults.SetNamedValue("nextEpisodeCountdown", JsonHelpers.CreateNumber(10));
             defaults.SetNamedValue("resumePlayback", JsonHelpers.CreateBool(true));
             defaults.SetNamedValue("hardwareDecoding", JsonHelpers.CreateBool(true));
+            defaults.SetNamedValue("playbackEngine", JsonHelpers.CreateString("auto"));
             // Streams
             defaults.SetNamedValue("showUnsupportedStreams", JsonHelpers.CreateBool(false));
             defaults.SetNamedValue("streamSort", JsonHelpers.CreateString("addon"));
@@ -245,5 +246,6 @@ namespace Nuvio.Services
         public bool ControllerCursor { get { return GetBool("controllerCursor", false); } }
         public bool RememberLastStream { get { return GetBool("rememberLastStream", true); } }
         public bool HardwareDecoding { get { return GetBool("hardwareDecoding", true); } }
+        public string PlaybackEngine { get { return GetString("playbackEngine", "auto"); } }
     }
 }
