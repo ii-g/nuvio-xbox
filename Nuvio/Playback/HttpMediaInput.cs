@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using LibVLCSharp.Shared;
 using Nuvio.Diagnostics;
 using Windows.Web.Http;
@@ -33,6 +34,37 @@ namespace Nuvio.Playback
         private bool _supportsRanges;
         private bool _aborted;
         private bool _retriedRead;
+
+        // Stop diagnostics (step 2b): progress counters for the input
+        // thread, read by the 5s stop watcher only. Cheap writes, no log
+        // lines (Read is a hot path), no branching on them anywhere.
+        private long _readCount;
+        private long _lastReadUtcTicks;
+        private long _closeCount;
+
+        internal long ReadCount
+        {
+            get { return Interlocked.Read(ref _readCount); }
+        }
+
+        internal long CloseCount
+        {
+            get { return Interlocked.Read(ref _closeCount); }
+        }
+
+        /// <summary>Milliseconds since the last Read, or -1 when no Read ever ran.</summary>
+        internal long LastReadAgeMs
+        {
+            get
+            {
+                var ticks = Interlocked.Read(ref _lastReadUtcTicks);
+                if (ticks == 0)
+                {
+                    return -1;
+                }
+                return (long)(DateTime.UtcNow - new DateTime(ticks)).TotalMilliseconds;
+            }
+        }
 
         public HttpMediaInput(string url, IDictionary<string, string> headers)
         {
@@ -71,6 +103,8 @@ namespace Nuvio.Playback
 
         public override int Read(IntPtr buf, uint len)
         {
+            Interlocked.Increment(ref _readCount);
+            Interlocked.Exchange(ref _lastReadUtcTicks, DateTime.UtcNow.Ticks);
             try
             {
                 var read = ReadOnce(len);
@@ -146,6 +180,7 @@ namespace Nuvio.Playback
 
         public override void Close()
         {
+            Interlocked.Increment(ref _closeCount);
             lock (_sync)
             {
                 CloseResponse();
