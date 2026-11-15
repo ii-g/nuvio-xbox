@@ -67,6 +67,41 @@ namespace Nuvio.Playback
         private int _stopsInFlight;        // stop tasks issued and not yet finished
         private bool _playerPoisoned;      // current _mediaPlayer had a stop that outran StopGrace
         private bool _disposePending;      // Dispose() was called while a stop was running
+        // Stop diagnostics (step 2b): one id per stop thread, plus the
+        // launch-time values of the running stop so a joiner logs the same
+        // stop instead of inventing its own.
+        private long _stopSeq;
+        private long _runningStopSeq = -1;
+        private long _runningStopEpoch = -1;
+        private int _runningStopVout = -1;
+        private string _runningStopState;
+        // Last player abandoned by a stop that outran StopGrace, with the
+        // stop that abandoned it. Updated on every timeout (the proximate
+        // abandon, not the first per epoch). Read by the detach/attach log
+        // lines only; never used to decide anything. The wrapper reference
+        // is kept until the next abandon; the native player itself is
+        // already disposed by its stop thread.
+        private long _lastAbandonedStop = -1;
+        private MediaPlayer _lastAbandonedPlayer;
+        // Detach (step 2a, layer 1) is requested once per abandoned epoch.
+        private long _lastDetachEpoch = -1;
+        // Layer 2 (step 2a) is implemented but OFF by default: the surface
+        // is only replaced after the stop diagnostics prove the stuck
+        // thread is inside vout teardown. Flip only on an explicit
+        // decision; while off, the timeout branch logs the skip.
+        private static readonly bool ReplaceSurfaceOnAbandonedStop = false;
+        private long _lastSurfaceReplaceEpoch = -1;
+        private long _surfaceReplacementEpoch = -1;
+        // A surface replacement was requested and new swap-chain options
+        // are awaited: ApplySwapChainOptionsOnWorker routes them to the
+        // layer-2 re-create instead of the idle-only MaybeRecreate.
+        private bool _surfaceReplacementPending;
+        // LibVLC instance parked for the stop thread: the layer-2 re-create
+        // must not dispose the instance while its stop still owns the
+        // player, so RunStop's finally disposes it when Stop() returns.
+        // Guarded by _stopLock.
+        private LibVLC _abandonedLibVlc;
+        private MediaPlayer _abandonedLibVlcPlayer;
         // Generation of the live MediaPlayer, bumped on every (re)creation.
         // VLC events carry the epoch they were raised under; a late event
         // from an abandoned player must never be mistaken for an event of
@@ -154,6 +189,47 @@ namespace Nuvio.Playback
         /// <summary>Raised once LibVLC exists so the VideoView can be attached to it.</summary>
         public event Action<MediaPlayer> MediaPlayerCreated;
 
+        /// <summary>
+        /// Raised (fire-and-forget, on the worker) when a stop outran
+        /// StopGrace: the VideoView must be detached from the abandoned
+        /// player. The request carries the abandoned player, the stop that
+        /// abandoned it and its epoch, plus a completion the handler sets
+        /// on every path (success, skip or failure) so the 2s watchdog can
+        /// tell a late UI thread from a lost request. Layer 1 of step 2a:
+        /// the managed detach changes no native reference (LibVLCSharp
+        /// 3.10.1 Attach/Detach are empty), it only cuts the managed
+        /// binding and proves the detach happened in the log.
+        /// </summary>
+        public event Action<VlcDetachRequest> VideoViewDetachRequested;
+
+        /// <summary>
+        /// Raised (fire-and-forget, on the worker) with the layer-1 detach
+        /// when a stop outran StopGrace and the layer-2 surface-replacement
+        /// flag is on. The UI side unloads and reloads the VideoView; the
+        /// new swap-chain options then route to
+        /// RecreateLibVlcWithSwapChainOptions. Never raised while the flag
+        /// is off (the timeout branch logs the skip instead).
+        /// </summary>
+        public event Action<long, long> VideoSurfaceReplaceRequested;
+
+        /// <summary>Current player generation, for the detach epoch guard.</summary>
+        internal long PlayerEpoch
+        {
+            get { return Interlocked.Read(ref _playerEpoch); }
+        }
+
+        /// <summary>Stop that last abandoned a player (-1 when none).</summary>
+        internal long LastAbandonedStop
+        {
+            get { lock (_stopLock) { return _lastAbandonedStop; } }
+        }
+
+        /// <summary>Player the last abandoned stop targeted (may be disposed already).</summary>
+        internal MediaPlayer LastAbandonedPlayer
+        {
+            get { lock (_stopLock) { return _lastAbandonedPlayer; } }
+        }
+
         /// <summary>Raised when frames of the current stream start or stop being shown.</summary>
         public event Action<bool> VideoVisibleChanged;
 
@@ -166,6 +242,14 @@ namespace Nuvio.Playback
         /// changes playback, and a probe failure is logged, not thrown.
         /// </summary>
         public Func<MediaPlayer, string> ViewStateProbe { get; set; }
+
+        /// <summary>
+        /// Optional UI-thread probe supplied by the hybrid player: whether
+        /// the VideoView is bound to the given player. The stop watcher
+        /// calls it through RunOnUi for the abandoned player of a stuck
+        /// stop; null when no view is bound. Diagnostic only.
+        /// </summary>
+        public Func<MediaPlayer, bool> ViewBoundToPlayer { get; set; }
 
         /// <summary>The LibVLC version once it has started, otherwise null.</summary>
         public string Version { get; private set; }
@@ -214,7 +298,15 @@ namespace Nuvio.Playback
             }
             lock (_swapChainLock)
             {
-                _swapChainOptions = copy;
+                // A reloaded VideoView reports a new swap chain (new
+                // pointers): the stored options are no longer the applied
+                // ones, so the worker must re-create LibVLC with them.
+                // Identical options change nothing (the usual first load).
+                if (_swapChainOptions == null || !OptionsEqual(_swapChainOptions, copy))
+                {
+                    _swapChainOptions = copy;
+                    _swapChainOptionsApplied = false;
+                }
             }
             if (Interlocked.CompareExchange(ref _initStarted, 0, 0) == 0)
             {
@@ -249,7 +341,28 @@ namespace Nuvio.Playback
                 Log.Write("LibVLC swap-chain options arrived while VLC is playing; keeping them for the next start");
                 return;
             }
+            if (_surfaceReplacementPending)
+            {
+                RecreateLibVlcWithSwapChainOptions();
+                return;
+            }
             MaybeRecreateWithSwapChainOptions();
+        }
+
+        private static bool OptionsEqual(string[] a, string[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length)
+            {
+                return false;
+            }
+            for (var i = 0; i < a.Length; i++)
+            {
+                if (!string.Equals(a[i], b[i], StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         // Worker. Re-creates LibVLC with the stored swap-chain options, if it was started
@@ -299,6 +412,116 @@ namespace Nuvio.Playback
             // _ready stays set and _initStarted stays 1: creation below runs synchronously on
             // this queue, so any Open queued after this sees the new instance without waiting.
             CreateLibVlc(stored);
+        }
+
+        // Worker. Layer 2 of step 2a: re-creates LibVLC on the swap chain
+        // of a reloaded VideoView, after a stop outran StopGrace. Unlike
+        // MaybeRecreateWithSwapChainOptions it does NOT refuse while a stop
+        // is outstanding — the outstanding stop is the reason it runs —
+        // and it never disposes a player its stop thread still owns: the
+        // old LibVLC instance is parked for RunStop's finally instead.
+        // Only called through ApplySwapChainOptionsOnWorker while a surface
+        // replacement is pending, and only while the layer-2 flag is on.
+        // If an Open raced in before the new options arrived, the
+        // playing guard in ApplySwapChainOptionsOnWorker defers this and
+        // the next Stop or Open picks the stored options up through
+        // MaybeRecreateWithSwapChainOptions instead (once the stop is gone).
+        private void RecreateLibVlcWithSwapChainOptions()
+        {
+            _surfaceReplacementPending = false;
+            if (_disposed || _unavailable)
+            {
+                return;
+            }
+            string[] stored;
+            lock (_swapChainLock)
+            {
+                stored = _swapChainOptions;
+                if (stored == null || _swapChainOptionsApplied)
+                {
+                    if (stored != null && _surfaceReplacementEpoch >= 0 &&
+                        Interlocked.Read(ref _playerEpoch) > _surfaceReplacementEpoch)
+                    {
+                        Log.Write("LibVLC re-create on new swap chain skipped (newer player exists, epoch=" + Interlocked.Read(ref _playerEpoch) + ")");
+                    }
+                    return;
+                }
+            }
+            var epochAtStart = Interlocked.Read(ref _playerEpoch);
+            Log.Write("Recreating LibVLC with new swap-chain options after abandoned stop (epoch=" + epochAtStart + ")");
+            LibVLC oldLibVlc;
+            MediaPlayer oldPlayer;
+            bool parkOldInstance;
+            lock (_stopLock)
+            {
+                oldLibVlc = _libVlc;
+                oldPlayer = _mediaPlayer;
+                if (oldLibVlc == null)
+                {
+                    Log.Write("LibVLC re-create on new swap chain skipped (no instance, epoch=" + Interlocked.Read(ref _playerEpoch) + ")");
+                    return;
+                }
+                parkOldInstance = _stopPlayer != null && _stopPlayer == oldPlayer;
+                if (parkOldInstance)
+                {
+                    if (_abandonedLibVlc != null)
+                    {
+                        // A previous abandoned instance is still parked
+                        // (its stop never returned): do not lose the
+                        // reference by overwriting it; the new options stay
+                        // stored for the next Stop or Open.
+                        Log.Write("LibVLC re-create on new swap chain skipped (abandoned instance still pending, epoch=" + Interlocked.Read(ref _playerEpoch) + ")");
+                        _surfaceReplacementPending = true;
+                        return;
+                    }
+                    _abandonedLibVlc = oldLibVlc;
+                    _abandonedLibVlcPlayer = oldPlayer;
+                }
+            }
+            if (oldLibVlc != null)
+            {
+                oldLibVlc.Log -= OnLibVlcLog;
+            }
+            if (parkOldInstance)
+            {
+                // The stop thread owns the old player until Stop() returns;
+                // it disposes the player (RunStop finally) and the parked
+                // instance with it. Only the live references move here.
+                _mediaPlayer = null;
+                _libVlc = null;
+            }
+            else
+            {
+                // No stop owns the live player (RecreatePlayer already
+                // replaced it on the old instance): dispose directly, as
+                // MaybeRecreateWithSwapChainOptions does.
+                if (oldPlayer != null)
+                {
+                    try
+                    {
+                        oldPlayer.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("Disposing the replaced VLC player failed", ex);
+                    }
+                }
+                _mediaPlayer = null;
+                try
+                {
+                    oldLibVlc.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("Disposing the replaced LibVLC instance failed", ex);
+                }
+                _libVlc = null;
+            }
+            _initError = null;
+            Interlocked.Exchange(ref _vlcLogLines, 0);
+            Interlocked.Exchange(ref _vlcLogSuppressed, 0);
+            CreateLibVlc(stored);
+            Log.Write("LibVLC re-created on new swap chain (epoch=" + Interlocked.Read(ref _playerEpoch) + ")");
         }
 
         // Runs on a worker thread: Initialize's Task.Run, or the serial worker queue for a
@@ -641,6 +864,8 @@ namespace Nuvio.Playback
             _disposed = true;
             EventRaised = null;
             MediaPlayerCreated = null;
+            VideoViewDetachRequested = null;
+            VideoSurfaceReplaceRequested = null;
             VideoVisibleChanged = null;
             Enqueue(() =>
             {
@@ -850,7 +1075,7 @@ namespace Nuvio.Playback
             using (media)
             {
                 var accepted = _mediaPlayer.Play(media);
-                Log.Write("VLC play requested (accepted=" + accepted + " state=" + SafeState() + ")");
+                Log.Write("VLC play requested (accepted=" + accepted + " state=" + SafeState() + ") (epoch=" + Interlocked.Read(ref _playerEpoch) + ")");
             }
             return true;
         }
@@ -884,6 +1109,11 @@ namespace Nuvio.Playback
             MediaPlayer player;
             HttpMediaInput input;
             Task stopTask;
+            long stopSeq;
+            long epochAtStop;
+            int voutAtStop;
+            string stateAtStop;
+            bool joined;
             lock (_stopLock)
             {
                 player = _mediaPlayer;
@@ -899,26 +1129,52 @@ namespace Nuvio.Playback
                     // A stop for this same player is already running; joining
                     // it instead of calling Stop() a second time.
                     stopTask = _stopTask;
+                    stopSeq = _runningStopSeq;
+                    epochAtStop = _runningStopEpoch;
+                    voutAtStop = _runningStopVout;
+                    stateAtStop = _runningStopState;
+                    joined = true;
+                    Log.Write("VLC stop join (stop=" + stopSeq + " epoch=" + epochAtStop + " state=" + stateAtStop + ")");
                 }
                 else
                 {
                     var started = DateTime.UtcNow;
-                    stopTask = Task.Factory.StartNew(() => RunStop(player, input, started),
+                    epochAtStop = Interlocked.Read(ref _playerEpoch);
+                    // Live vout read on the worker (the OnVideoOutput
+                    // precedent): the managed _voutCount was just zeroed
+                    // above, so only a live read says whether this stop
+                    // had a video output. Never read while a stop is
+                    // already running for this player — the join branch
+                    // above reuses the launch values instead.
+                    voutAtStop = -1;
+                    try
+                    {
+                        voutAtStop = (int)player.VoutCount;
+                    }
+                    catch (Exception)
+                    {
+                        voutAtStop = -1;
+                    }
+                    stateAtStop = SafeState();
+                    stopSeq = Interlocked.Increment(ref _stopSeq);
+                    _runningStopSeq = stopSeq;
+                    _runningStopEpoch = epochAtStop;
+                    _runningStopVout = voutAtStop;
+                    _runningStopState = stateAtStop;
+                    joined = false;
+                    stopTask = Task.Factory.StartNew(() => RunStop(player, input, started, stopSeq, epochAtStop, voutAtStop, stateAtStop),
                         CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
                     _stopPlayer = player;
                     _stopTask = stopTask;
                     _stopsInFlight++;
-                    Log.Write("VLC stop requested (state=" + SafeState() + ")");
+                    Log.Write("VLC stop requested (stop=" + stopSeq + " epoch=" + epochAtStop + " state=" + stateAtStop + " vout=" + voutAtStop + " new)");
                     // Diagnostic horizon only: recovery already happened (or
-                    // was refused) at StopGrace; this line just says the stop
+                    // was refused) at StopGrace; this snapshot just says the stop
                     // is still stuck long after any healthy stop would have
                     // returned.
                     var ignored = Task.Delay(StopTimeout).ContinueWith(_ =>
                     {
-                        if (!stopTask.IsCompleted)
-                        {
-                            Log.Write("VLC stop still has not returned after 5s; the player is abandoned (its stop thread, input and player leak until the stop ever returns)");
-                        }
+                        LogStopStillStuck(stopTask, player, input, stopSeq, epochAtStop);
                     }, TaskScheduler.Default);
                 }
             }
@@ -935,15 +1191,132 @@ namespace Nuvio.Playback
             {
                 return true;
             }
+            bool poisoned;
             lock (_stopLock)
             {
                 if (_mediaPlayer == player)
                 {
                     _playerPoisoned = true;
                 }
+                poisoned = _playerPoisoned;
+                _lastAbandonedStop = stopSeq;
+                _lastAbandonedPlayer = player;
             }
-            Log.Write("VLC stop did not return within 500ms; the player will be replaced before the next play");
+            Log.Write("VLC stop did not return within 500ms; the player will be replaced before the next play (stop=" + stopSeq + " epoch=" + epochAtStop + " state=" + stateAtStop + " vout=" + voutAtStop + " poisoned=" + poisoned + " join=" + joined + ")");
+            RequestDetachAndSurfaceReplacement(player, stopSeq, epochAtStop);
             return false;
+        }
+
+        // Worker. Timeout branch of StopPlayer only: requests the layer-1
+        // managed detach (once per abandoned epoch) and, when the layer-2
+        // flag is on, the surface replacement (also once per epoch; while
+        // the flag is off the skip is logged once per epoch to prove the
+        // skip was deliberate, not forgotten). Fire-and-forget throughout:
+        // no waiting, no retry, no effect on the stop itself.
+        private void RequestDetachAndSurfaceReplacement(MediaPlayer abandonedPlayer, long stopSeq, long epoch)
+        {
+            bool requestDetach;
+            lock (_stopLock)
+            {
+                requestDetach = epoch != _lastDetachEpoch;
+                if (requestDetach)
+                {
+                    _lastDetachEpoch = epoch;
+                }
+            }
+            if (requestDetach)
+            {
+                var completion = new TaskCompletionSource<object>();
+                Log.Write("VLC stop detach requested (stop=" + stopSeq + " epoch=" + epoch + ")");
+                VideoViewDetachRequested?.Invoke(new VlcDetachRequest(abandonedPlayer, stopSeq, epoch, completion));
+                // Detach watchdog: the managed detach cannot hang on VLC
+                // (LibVLCSharp Attach/Detach are empty), so a late
+                // completion means a busy UI thread, not a stuck detach.
+                // Logging only; never a retry, never a wait.
+                var ignored = Task.Delay(TimeSpan.FromSeconds(2)).ContinueWith(_ =>
+                {
+                    if (!completion.Task.IsCompleted)
+                    {
+                        Log.Write("VLC video view detach did not complete within 2s (stop=" + stopSeq + " epoch=" + epoch + ")");
+                    }
+                }, TaskScheduler.Default);
+            }
+            bool requestReplacement;
+            lock (_stopLock)
+            {
+                requestReplacement = epoch != _lastSurfaceReplaceEpoch;
+                if (requestReplacement)
+                {
+                    _lastSurfaceReplaceEpoch = epoch;
+                }
+            }
+            if (requestReplacement)
+            {
+                if (ReplaceSurfaceOnAbandonedStop)
+                {
+                    _surfaceReplacementEpoch = epoch;
+                    _surfaceReplacementPending = true;
+                    Log.Write("VLC video surface replace requested (stop=" + stopSeq + " epoch=" + epoch + ")");
+                    VideoSurfaceReplaceRequested?.Invoke(stopSeq, epoch);
+                }
+                else
+                {
+                    Log.Write("VLC video surface replacement skipped (flag off, stop=" + stopSeq + " epoch=" + epoch + ")");
+                }
+            }
+        }
+
+        // Stop-watcher continuation (thread pool, once per stuck stop
+        // thread, at StopTimeout). Managed fields only — never LibVLC,
+        // never the VideoView: the watcher must not block on the same
+        // locks the stuck stop may hold, and must not touch UI objects
+        // off the UI thread. The input counters are the captured input's
+        // (RunStop's), never _input (already null). The view probe is sent
+        // separately through RunOnUi and may appear after this line.
+        private void LogStopStillStuck(Task stopTask, MediaPlayer abandonedPlayer, HttpMediaInput input, long stopSeq, long epochAtStop)
+        {
+            if (stopTask.IsCompleted)
+            {
+                return;
+            }
+            int inFlight;
+            bool poisoned;
+            lock (_stopLock)
+            {
+                inFlight = _stopsInFlight;
+                poisoned = _playerPoisoned;
+            }
+            long reads = 0;
+            long readAgeMs = -1;
+            bool closed = false;
+            if (input != null)
+            {
+                reads = input.ReadCount;
+                readAgeMs = input.LastReadAgeMs;
+                closed = input.CloseCount > 0;
+            }
+            Log.Write("VLC stop still has not returned after 5s; the player is abandoned (its stop thread, input and player leak until the stop ever returns) (stop=" + stopSeq + " epoch=" + epochAtStop + " alive=True stopsInFlight=" + inFlight + " poisoned=" + poisoned + " inputReads=" + reads + " inputReadAgeMs=" + readAgeMs + " inputClosed=" + closed + ")");
+            RunOnUi(() =>
+            {
+                Log.Write("VLC stop watch view probe (stop=" + stopSeq + " epoch=" + epochAtStop + " viewBoundToOld=" + ProbeViewBoundTo(abandonedPlayer) + ")");
+            });
+        }
+
+        private string ProbeViewBoundTo(MediaPlayer player)
+        {
+            var probe = ViewBoundToPlayer;
+            if (probe == null)
+            {
+                return "unknown";
+            }
+            try
+            {
+                return probe(player) ? "True" : "False";
+            }
+            catch (Exception)
+            {
+                return "unknown";
+            }
         }
 
         // Stop thread. Runs the one blocking call, then owns the captured
@@ -952,7 +1325,7 @@ namespace Nuvio.Playback
         // then), and the player is disposed only if it has already been
         // replaced (the live player is never disposed from here) — or if
         // Dispose() is pending and this is the last stop still running.
-        private void RunStop(MediaPlayer player, HttpMediaInput input, DateTime started)
+        private void RunStop(MediaPlayer player, HttpMediaInput input, DateTime started, long stopSeq, long epochAtStop, int voutAtStop, string stateAtStop)
         {
             try
             {
@@ -960,14 +1333,14 @@ namespace Nuvio.Playback
                 // a later log with this line but no "stop done" line proves
                 // the stop thread is stuck inside Stop() itself (M1), not
                 // before it.
-                Log.Write("VLC stop entering player.Stop()");
+                Log.Write("VLC stop entering player.Stop() (stop=" + stopSeq + " epoch=" + epochAtStop + " state=" + stateAtStop + " vout=" + voutAtStop + " thread=" + Thread.CurrentThread.ManagedThreadId + ")");
                 player.Stop();
                 var elapsed = (long)(DateTime.UtcNow - started).TotalMilliseconds;
-                Log.Write("VLC stop done (took " + elapsed + "ms)");
+                Log.Write("VLC stop done (took " + elapsed + "ms) (stop=" + stopSeq + " epoch=" + epochAtStop + " thread=" + Thread.CurrentThread.ManagedThreadId + ")");
             }
             catch (Exception ex)
             {
-                Log.Error("VLC stop failed", ex);
+                Log.Error("VLC stop failed (stop=" + stopSeq + " epoch=" + epochAtStop + ")", ex);
             }
             finally
             {
@@ -982,6 +1355,7 @@ namespace Nuvio.Playback
                 MediaPlayer capturedToDispose = null;
                 MediaPlayer liveToDispose = null;
                 LibVLC libVlc = null;
+                LibVLC abandonedLibVlc = null;
                 lock (_stopLock)
                 {
                     _stopsInFlight--;
@@ -1010,6 +1384,15 @@ namespace Nuvio.Playback
                         _mediaPlayer = null;
                         libVlc = _libVlc;
                         _libVlc = null;
+                    }
+                    if (_abandonedLibVlc != null && _abandonedLibVlcPlayer == player)
+                    {
+                        // Layer 2 parked the old instance here instead of
+                        // disposing it while this stop owned the player:
+                        // Stop() has returned now, so reclaim it.
+                        abandonedLibVlc = _abandonedLibVlc;
+                        _abandonedLibVlc = null;
+                        _abandonedLibVlcPlayer = null;
                     }
                 }
                 if (capturedToDispose != null)
@@ -1043,6 +1426,17 @@ namespace Nuvio.Playback
                     catch (Exception ex)
                     {
                         Log.Error("Disposing LibVLC after a deferred stop failed", ex);
+                    }
+                }
+                if (abandonedLibVlc != null)
+                {
+                    try
+                    {
+                        abandonedLibVlc.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("Disposing the abandoned LibVLC instance failed", ex);
                     }
                 }
             }
@@ -1106,13 +1500,20 @@ namespace Nuvio.Playback
             }
             Subscribe(player);
             _mediaPlayer = player;
+            var oldEpoch = Interlocked.Read(ref _playerEpoch);
             Interlocked.Increment(ref _playerEpoch);
+            var newEpoch = Interlocked.Read(ref _playerEpoch);
             lock (_stopLock)
             {
                 _playerPoisoned = false;
             }
             var version = _libVlc.Version;
-            Log.Write("Recreated the VLC player after a stop that did not return");
+            long stop;
+            lock (_stopLock)
+            {
+                stop = _lastAbandonedStop;
+            }
+            Log.Write("Recreated the VLC player after a stop that did not return (stop=" + stop + " oldEpoch=" + oldEpoch + " newEpoch=" + newEpoch + ")");
             RunOnUi(() =>
             {
                 Version = version;
@@ -1314,7 +1715,7 @@ namespace Nuvio.Playback
             _voutCount = (int)_mediaPlayer.VoutCount;
             if (width > 0 && height > 0)
             {
-                Log.Write("VLC video output ready (" + width + "x" + height + ")");
+                Log.Write("VLC video output ready (" + width + "x" + height + ") (epoch=" + Interlocked.Read(ref _playerEpoch) + ")");
             }
             RunOnUi(() =>
             {
@@ -1802,5 +2203,27 @@ namespace Nuvio.Playback
             var text = new string(chars).Trim(' ', '\0');
             return text.Length == 0 ? null : text.ToLowerInvariant();
         }
+    }
+
+    /// <summary>
+    /// A layer-1 detach request: the VideoView must be detached from this
+    /// abandoned player (the stop that abandoned it, and its epoch).
+    /// Completion is set by the handler on every path so the 2s watchdog
+    /// can tell a late UI thread from a lost request.
+    /// </summary>
+    internal sealed class VlcDetachRequest
+    {
+        public VlcDetachRequest(MediaPlayer abandonedPlayer, long stopSeq, long epoch, TaskCompletionSource<object> completion)
+        {
+            AbandonedPlayer = abandonedPlayer;
+            StopSeq = stopSeq;
+            Epoch = epoch;
+            Completion = completion;
+        }
+
+        public MediaPlayer AbandonedPlayer { get; }
+        public long StopSeq { get; }
+        public long Epoch { get; }
+        public TaskCompletionSource<object> Completion { get; }
     }
 }
