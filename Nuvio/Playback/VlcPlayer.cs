@@ -90,17 +90,6 @@ namespace Nuvio.Playback
         private long _loadSeq;
         private string _pageId;
         private bool _readySent;
-        // First-frame gate for the video view (log 25, fix (a) part 2):
-        // the view is shown only once a frame has actually been presented
-        // for this load, never on vout creation or a timeout. _firstFrameShown
-        // is the per-load latch; _displayedBaseline is the first
-        // DisplayedPictures count observed for this load (-1 = not yet seen).
-        // The baseline matters because the counters lag across reopens
-        // (log 25: a stale readBytes, a frozen displayed count), so a stale
-        // nonzero count must never pass as a fresh frame — only an increase
-        // over the baseline proves presentation during this load.
-        private bool _firstFrameShown;
-        private long _displayedBaseline = -1;
         private bool _durationSent;
         private int _lastBufferingPercent = -1;
         private DateTime _lastTimeReport = DateTime.MinValue;
@@ -779,8 +768,6 @@ namespace Nuvio.Playback
         {
             _loadSeq++;
             _readySent = false;
-            _firstFrameShown = false;
-            _displayedBaseline = -1;
             _durationSent = false;
             _lastBufferingPercent = -1;
             _vlcBuffering = false;
@@ -1593,14 +1580,6 @@ namespace Nuvio.Playback
                 _lastVlcStatsLog = now;
                 LogVlcStats(timeMs);
             }
-            // First presented frame, not first stats line: the view is shown
-            // from here (see CheckFirstFramePresented), at most once per
-            // 250ms tick, so the show lags the first presented frame by
-            // about one tick.
-            if (!_firstFrameShown && _hasPlayed && _voutCount > 0)
-            {
-                CheckFirstFramePresented(seq: _loadSeq);
-            }
         }
 
         // UI thread. Media.Statistics wraps libvlc_media_get_stats; the
@@ -1658,12 +1637,11 @@ namespace Nuvio.Playback
         // UI thread. Marks the load ready: raises player.ready, which the
         // view model turns into Ready (hides the loading spinner, enables
         // the controls) and which ends the open watchdog exactly as before.
-        // It deliberately does NOT show the video view anymore. Readiness
-        // means "playback is usable"; the view is shown separately by
-        // MarkFirstFrameShown once a frame has actually been presented, so
-        // the 2s fallback below can no longer expose a stale or uninitialised
-        // surface: for audio-only it fires ready with the view still hidden,
-        // which is the correct state (there is no video to show).
+        // It also shows the video view again (the pre-gate behaviour): on
+        // vout creation, or on the 2s fallback for audio-only and for loads
+        // whose video output never arrives. The first-frame gate that used
+        // to own the show (log 31) is rolled back: it never opened, so the
+        // view stayed black for every load.
         private void MarkVideoReady(long seq, bool hasVideoOutput)
         {
             if (seq != _loadSeq || _readySent || Interlocked.Read(ref _openFailedSeq) == seq)
@@ -1673,63 +1651,8 @@ namespace Nuvio.Playback
             _readySent = true;
             Log.Write((hasVideoOutput ? "VLC video track ready" : "VLC ready (no video output yet)") +
                 " [view: " + ProbeViewState() + "]");
-            Raise("player.ready", new JsonObject());
-        }
-
-        // UI thread. The only signal in LibVLCSharp for "a frame was
-        // actually presented" is Media.Statistics.DisplayedPictures (there
-        // is no first-frame event on MediaPlayer or VideoView): it counts
-        // frames the vout presented, so vout creation alone — the old show
-        // condition — does not move it. Runs on the OnTimeChanged tick
-        // (at most every 250ms while time advances), so the show lags the
-        // first presented frame by about one tick, typically under half a
-        // second. A load whose time pulse stops (log 25 opening 3: zero
-        // stats in 20s while Playing) never shows the view, which is honest:
-        // nothing is being presented. A load that is paused at open shows
-        // nothing until it resumes and time advances.
-        private void CheckFirstFramePresented(long seq)
-        {
-            try
-            {
-                var player = _mediaPlayer;
-                if (player == null) return;
-                using (var media = player.Media)
-                {
-                    if (media == null) return;
-                    var displayed = media.Statistics.DisplayedPictures;
-                    if (_displayedBaseline < 0)
-                    {
-                        _displayedBaseline = displayed;
-                        Log.Write("VLC first-frame watch armed (displayed=" + displayed + ")");
-                        return;
-                    }
-                    if (displayed > _displayedBaseline)
-                    {
-                        MarkFirstFrameShown(seq, displayed);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Write("VLC first-frame check: could not read statistics: " + ex.GetType().Name);
-            }
-        }
-
-        // UI thread. Shows the video view on the first frame presented for
-        // this load. The probe runs before VideoVisibleChanged applies the
-        // show: it answers whether this exact player was already bound to
-        // the view when the frame landed (the opacity it reports is the
-        // pre-show value; the hybrid player logs the applied opacity right
-        // after it sets it).
-        private void MarkFirstFrameShown(long seq, long displayed)
-        {
-            if (seq != _loadSeq || _firstFrameShown || Interlocked.Read(ref _openFailedSeq) == seq)
-            {
-                return;
-            }
-            _firstFrameShown = true;
-            Log.Write("VLC first frame presented (displayed=" + displayed + ") [view: " + ProbeViewState() + "]");
             VideoVisibleChanged?.Invoke(true);
+            Raise("player.ready", new JsonObject());
         }
 
         private async void ScheduleReadyFallback(long seq)
