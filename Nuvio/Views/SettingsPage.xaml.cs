@@ -31,8 +31,8 @@ namespace Nuvio.Views
     }
 
     /// <summary>
-    /// Settings (Milestone 6, Addons + Debrid only): root list, the Addons section
-    /// and the Debrid section. Ported from web/js/views/settings.js (settingsView /
+    /// Settings (Milestone 6, Addons + Debrid + Playback): root list, the Addons section,
+    /// the Debrid section and the Playback section. Ported from web/js/views/settings.js (settingsView /
     /// addonsPage / debridPage). The ViewModel owns state and operations; this class
     /// renders rows and addon cards imperatively so focus can be restored by key
     /// (transportUrl|action) across re-renders. No custom input handling: the
@@ -113,7 +113,8 @@ namespace Nuvio.Views
         /// rows "root|&lt;id&gt;" (a bare row id is accepted too), addon actions
         /// "&lt;manifestUrl&gt;|&lt;action&gt;" (the existing re-render key — a
         /// manifest URL, not a stream URL or secret), debrid rows
-        /// "debrid|&lt;providerId&gt;" / "debrid|disconnect", and the addons
+        /// "debrid|&lt;providerId&gt;" / "debrid|disconnect", playback rows
+        /// "playback|engine|&lt;auto|ffmpeg|vlc&gt;", and the addons
         /// section chrome "addons|install" / "addons|reset".</summary>
         public override bool TryFocusKey(string key)
         {
@@ -134,9 +135,13 @@ namespace Nuvio.Views
                 if (key == "addons|reset") return ResetAddonsButton.Focus(FocusState.Programmatic);
                 return false;
             }
-            if (_section == "debrid")
+            if (_section == "debrid" || _section == "playback")
             {
-                var debridButton = FindButtonByTag(DebridHost, key);
+                // One shared branch for both sections, through the same local:
+                // the focus guard (tools/check-focus-guard.py) allowlists every
+                // focus call site by (method, receiver), so a second focus call
+                // here would fail it. The host is what differs per section.
+                var debridButton = FindButtonByTag(_section == "playback" ? PlaybackHost : DebridHost, key);
                 return debridButton != null && debridButton.Focus(FocusState.Programmatic);
             }
             return false;
@@ -165,6 +170,7 @@ namespace Nuvio.Views
             RootPanel.Visibility = Visibility.Collapsed;
             AddonsPanel.Visibility = Visibility.Collapsed;
             DebridPanel.Visibility = Visibility.Collapsed;
+            PlaybackPanel.Visibility = Visibility.Collapsed;
             _firstFocusTarget = null;
             if (_section == "addons")
             {
@@ -186,6 +192,16 @@ namespace Nuvio.Views
                 DebridPanel.Visibility = Visibility.Visible;
                 RenderDebrid();
                 _firstFocusTarget = FirstButtonIn(DebridHost);
+            }
+            else if (_section == "playback")
+            {
+                PageTitle.Text = S("SettingsPlaybackTitle", "Playback");
+                PlaybackHint.Text = S("SettingsPlaybackEngineDescription", "Choose which engine plays video. Automatic tries FFmpeg first, then VLC on failure");
+                PlaybackEngineHeader.Text = S("SettingsPlaybackEngine", "Playback engine");
+                PlaybackEngineHint.Text = S("SettingsPlaybackEngineHint", "Applies to the next film you open, not to playback already running");
+                PlaybackPanel.Visibility = Visibility.Visible;
+                RenderPlayback();
+                _firstFocusTarget = FirstButtonIn(PlaybackHost);
             }
             else
             {
@@ -234,7 +250,7 @@ namespace Nuvio.Views
             var tag = button.Tag as string;
             if (string.IsNullOrEmpty(tag) || !tag.StartsWith("root|", StringComparison.Ordinal)) return;
             var id = tag.Substring("root|".Length);
-            if (id == "addons" || id == "debrid")
+            if (id == "addons" || id == "debrid" || id == "playback")
             {
                 _viewModel.Navigation.NavigateSettings(id);
                 return;
@@ -759,6 +775,53 @@ namespace Nuvio.Views
                 if (button != null) return button.Tag as string;
             }
             return null;
+        }
+
+        // ---------- Playback ----------
+
+        /// <summary>Three engine rows (automatic / FFmpeg only / VLC only): the
+        /// stored engine carries "✓", a tap stores the new engine and rebuilds
+        /// so the mark moves. The choice applies to the next open, never to
+        /// playback already running.</summary>
+        private void RenderPlayback()
+        {
+            PlaybackHost.Children.Clear();
+            var current = _viewModel.Settings.PlaybackEngine;
+            if (current != "ffmpeg" && current != "vlc") current = "auto";
+            AddPlaybackEngineRow("auto",
+                S("SettingsPlaybackEngineAuto", "Automatic"),
+                S("SettingsPlaybackEngineAutoDescription", "FFmpeg first, VLC as fallback on failure"), current);
+            AddPlaybackEngineRow("ffmpeg",
+                S("SettingsPlaybackEngineFfmpeg", "FFmpeg only"),
+                S("SettingsPlaybackEngineFfmpegDescription", "Never falls back to VLC — for testing and comparison"), current);
+            AddPlaybackEngineRow("vlc",
+                S("SettingsPlaybackEngineVlc", "VLC only"),
+                S("SettingsPlaybackEngineVlcDescription", "Plays with VLC from the first open — for testing and comparison"), current);
+        }
+
+        private void AddPlaybackEngineRow(string value, string label, string description, string current)
+        {
+            var button = BuildRowButton(label, description,
+                string.Equals(current, value, StringComparison.Ordinal) ? "✓" : null);
+            button.Tag = "playback|engine|" + value;
+            button.Click += PlaybackEngine_Click;
+            PlaybackHost.Children.Add(button);
+        }
+
+        private void PlaybackEngine_Click(object sender, RoutedEventArgs e)
+        {
+            var button = sender as Button;
+            if (button == null) return;
+            var tag = button.Tag as string;
+            if (string.IsNullOrEmpty(tag) || !tag.StartsWith("playback|engine|", StringComparison.Ordinal)) return;
+            var value = tag.Substring("playback|engine|".Length);
+            if (value != "auto" && value != "ffmpeg" && value != "vlc") return;
+            _viewModel.Settings.Set("playbackEngine", value);
+            RenderPlayback();
+            // The rebuild replaces the tapped row: focus it again through its
+            // key instead of a new focus call (the focus guard allowlists
+            // every focus call site, and TryFocusKey already owns this one).
+            TryFocusKey(tag);
         }
 
         // ---------- Confirm dialog ----------
