@@ -11,6 +11,7 @@ using Windows.Data.Json;
 using Windows.Media.Core;
 using Windows.Media.Playback;
 using Windows.Storage.Streams;
+using Windows.System;
 using Windows.UI.Xaml.Controls;
 
 namespace Nuvio.Playback
@@ -54,6 +55,16 @@ namespace Nuvio.Playback
         private double _pendingStartSeconds;
         private bool _playWhenOpened;
         private CancellationTokenSource _openCancellation;
+        private long _confirmedGeneration;
+        private long _playbackConfirmedTicks;
+        private double _confirmedPositionSeconds;
+        private int _videoSizeSeekDone;
+        private bool _videoSizeWasZero;
+        private int _pausedKickDone;
+        private double _pausedKickPositionSeconds;
+        private long _mediaPlayerCreated;
+        private long _heartbeatCount;
+        private double _surfaceOpacity;
 
         public event Action<string, JsonObject> EventRaised;
         public string Version { get; private set; } = "FFmpegInteropX";
@@ -94,6 +105,7 @@ namespace Nuvio.Playback
             {
                 _view.SetMediaPlayer(player);
                 _mediaPlayer = player;
+                Interlocked.Increment(ref _mediaPlayerCreated);
                 Log.Write("FFmpegInteropX player ready");
             }
             catch
@@ -122,6 +134,7 @@ namespace Nuvio.Playback
                 if (view.Dispatcher.HasThreadAccess)
                 {
                     view.Opacity = opacity;
+                    _surfaceOpacity = opacity;
                     return;
                 }
 
@@ -129,6 +142,7 @@ namespace Nuvio.Playback
                 {
                     if (_disposed || !ReferenceEquals(_view, view)) return;
                     view.Opacity = opacity;
+                    _surfaceOpacity = opacity;
                 });
             }
             catch (Exception ex)
@@ -156,6 +170,13 @@ namespace Nuvio.Playback
             _lastPositionSeconds = request == null ? 0 : Math.Max(0, request.StartSeconds);
             _playWhenOpened = false;
             _pendingStartSeconds = 0;
+            _playbackConfirmedTicks = 0;
+            _confirmedPositionSeconds = 0;
+            _videoSizeSeekDone = 0;
+            _videoSizeWasZero = false;
+            _confirmedGeneration = 0;
+            _pausedKickDone = 0;
+            _pausedKickPositionSeconds = 0;
             if (_view == null)
             {
                 FailOpen(generation, "The media player is not ready.", "PlayerNotReady");
@@ -178,6 +199,7 @@ namespace Nuvio.Playback
                 _openCancellation = new CancellationTokenSource();
                 var token = _openCancellation.Token;
                 RaiseState("opening", null);
+                Log.Write(MemorySnapshot());
 
                 // These tasks never block the WebView message/UI thread. The source resolver catches
                 // every failure itself, while a separate watchdog covers MediaPlayer.Open/Play stalls.
@@ -361,7 +383,44 @@ namespace Nuvio.Playback
                                 ConfirmOpenByPlayback(generation, session);
                                 return;
                             }
+                            // A4: frozen at the start — Paused with a full download
+                            // and no movement at 10s gets one Play() retry; still
+                            // Paused at 20s fails the open early instead of waiting
+                            // for the 30s timeout. _playWhenOpened is never raised
+                            // here (OnMediaOpened consumed it); the kick goes
+                            // straight to the player, as SetPaused does.
+                            if (tickElapsed == 10 && session.PlaybackState == MediaPlaybackState.Paused &&
+                                positionSeconds <= previousPositionSeconds && session.DownloadProgress >= 1.0 &&
+                                Interlocked.Exchange(ref _pausedKickDone, 1) == 0)
+                            {
+                                _pausedKickPositionSeconds = positionSeconds;
+                                try
+                                {
+                                    var player = _mediaPlayer;
+                                    if (player != null) player.Play();
+                                }
+                                catch (Exception ex) { Log.Error("Retrying paused FFmpeg playback failed", ex); }
+                                Log.Write("FFmpeg frozen at start (state=Paused pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s download=" + Math.Round(session.DownloadProgress * 100) + "% at 10s); retrying Play() once");
+                            }
+                            if (tickElapsed == 20 && _pausedKickDone == 1 && session.PlaybackState == MediaPlaybackState.Paused &&
+                                positionSeconds <= _pausedKickPositionSeconds && session.DownloadProgress >= 1.0)
+                            {
+                                Log.Write("FFmpeg still paused at start after Play() retry (pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s download=" + Math.Round(session.DownloadProgress * 100) + "% at 20s); failing open early");
+                                FailOpen(generation, "The stream stayed paused at the start after a playback retry.", "OpenTimeout");
+                                return;
+                            }
                             previousPositionSeconds = positionSeconds;
+                        }
+                        // A1: re-check the video size on every watchdog tick while
+                        // Playing — the 10s heartbeat is gated on _readySent, so
+                        // before confirmation this is the only periodic size
+                        // check. Gated on a non-zero size so the readiness-check
+                        // diagnostic does not repeat every 5s while the size is 0.
+                        if (session != null && session.PlaybackState == MediaPlaybackState.Playing &&
+                            session.NaturalVideoWidth != 0 && session.NaturalVideoHeight != 0)
+                        {
+                            SignalVideoReady(session);
+                            if (_readySent) return;
                         }
                         if (tickElapsed < (int)OpenTimeout.TotalSeconds) LogOpenProgress(tickElapsed);
                         else FailOpen(generation, "The stream did not start within 30 seconds. Check the link or network, then try again.", "OpenTimeout");
@@ -528,6 +587,40 @@ namespace Nuvio.Playback
             {
                 Log.Write("FFmpeg decoder (" + context + "): could not read decoder info: " + ex.GetType().Name);
             }
+        }
+
+        // One-line memory snapshot for the heartbeat (every 3rd) and the
+        // open baseline: app usage/limit/level from MemoryManager, plus
+        // the open count, the number of MediaPlayers ever created, and
+        // the last surface opacity (tracked in SetViewOpacity — the view
+        // itself is never read from a heartbeat thread). Never throws:
+        // "mem=n/a" if the counters cannot be read. No URLs or tokens.
+        private string MemorySnapshot()
+        {
+            try
+            {
+                var usage = MemoryManager.AppMemoryUsage;
+                var limit = MemoryManager.AppMemoryUsageLimit;
+                var usageMb = usage / (1024 * 1024);
+                var limitMb = limit / (1024 * 1024);
+                var pct = limit == 0 ? 0 : (int)(usage * 100 / limit);
+                return "FFmpeg memory: usage=" + usageMb + "MB limit=" + limitMb + "MB pct=" + pct + "% level=" + MemoryManager.AppMemoryUsageLevel +
+                    " opens=" + Interlocked.Read(ref _openGeneration) +
+                    " players=" + Interlocked.Read(ref _mediaPlayerCreated) +
+                    " surface=" + (_surfaceOpacity >= 0.5 ? "1" : "0");
+            }
+            catch (Exception)
+            {
+                return "mem=n/a";
+            }
+        }
+
+        // Output-degradation constriction reason for the ready line; "n/a"
+        // if the policy state cannot be read.
+        private static string ConstrictionReason(MediaPlaybackSession session)
+        {
+            try { return session.GetOutputDegradationPolicyState().VideoConstrictionReason.ToString(); }
+            catch (Exception) { return "n/a"; }
         }
 
         private void CancelPendingOpen()
@@ -798,8 +891,9 @@ namespace Nuvio.Playback
                 return;
 
             _readySent = true;
+            _confirmedGeneration = Interlocked.Read(ref _openGeneration);
             CancelPendingOpen();
-            Log.Write("FFmpeg video track ready (" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + ")");
+            Log.Write("FFmpeg video track ready (" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + ") constriction=" + ConstrictionReason(session));
             LogActualDecoder("ready");
             Raise("player.ready", new JsonObject());
             if (_view != null) SetViewOpacity(1);
@@ -820,6 +914,9 @@ namespace Nuvio.Playback
         {
             if (_disposed || _openFailed || _readySent || generation != Interlocked.Read(ref _openGeneration)) return;
             _readySent = true;
+            _confirmedGeneration = generation;
+            _playbackConfirmedTicks = DateTime.UtcNow.Ticks;
+            _confirmedPositionSeconds = session.Position.TotalSeconds;
             CancelPendingOpen();
             Log.Write("FFmpeg open confirmed by playback (state=" + session.PlaybackState +
                 " pos=" + Math.Round(session.Position.TotalSeconds) + "s" +
@@ -827,6 +924,75 @@ namespace Nuvio.Playback
             LogActualDecoder("playback-confirmed");
             Raise("player.ready", new JsonObject());
             if (_view != null) SetViewOpacity(1);
+            if (session.NaturalVideoWidth == 0 || session.NaturalVideoHeight == 0)
+            {
+                _videoSizeWasZero = true;
+                Log.Write("FFmpeg open confirmed with no video size; will fall back to VLC if size stays 0x0 for 30s");
+                _ = FailIfVideoStillMissingAsync(generation);
+            }
+        }
+
+        // A3: the open was confirmed by playback (audio advancing) but no
+        // video size ever appeared. Give the picture 30s to show up; if it
+        // still has not, fail the open so the hybrid player falls back to
+        // VLC — any FailOpen after confirmation raises player.ended with
+        // reason=error, which the hybrid treats as a fallback trigger.
+        // Generation-guarded on the UI thread before any action.
+        private async Task FailIfVideoStillMissingAsync(long generation)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                var view = _view;
+                if (view == null) return;
+                await view.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || generation != Interlocked.Read(ref _openGeneration) || _openFailed || !_readySent) return;
+                    var session = _mediaPlayer == null ? null : _mediaPlayer.PlaybackSession;
+                    if (session == null) return;
+                    if (session.NaturalVideoWidth != 0 && session.NaturalVideoHeight != 0)
+                    {
+                        Log.Write("FFmpeg video size appeared before 30s fallback (" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + "); no fallback");
+                        return;
+                    }
+                    if (session.PlaybackState == MediaPlaybackState.Paused)
+                    {
+                        Log.Write("FFmpeg video-size fallback skipped: state=Paused at 30s after confirm");
+                        return;
+                    }
+                    FailOpen(generation, "The stream plays audio but no video picture appeared within 30 seconds.", "VideoSizeZero");
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("FFmpeg video-size fallback check failed", ex);
+            }
+        }
+
+        // A1: periodic video-size re-check after the open was confirmed,
+        // from the winning heartbeat CAS in OnPositionChanged. The
+        // heartbeat proves the position is advancing, not that a picture
+        // exists: log once per heartbeat while the size stays 0x0, and
+        // once when a size appears after having been 0x0 at confirmation.
+        private void CheckVideoSizeAfterReady(MediaPlaybackSession session)
+        {
+            if (_disposed || _openFailed) return;
+            if (_confirmedGeneration != Interlocked.Read(ref _openGeneration)) return;
+            if (session.NaturalVideoWidth != 0 && session.NaturalVideoHeight != 0)
+            {
+                if (_videoSizeWasZero)
+                {
+                    _videoSizeWasZero = false;
+                    Log.Write("FFmpeg video size appeared after ready: " + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + " (was 0x0)");
+                }
+                return;
+            }
+            // _playbackConfirmedTicks is only set by ConfirmOpenByPlayback;
+            // a SignalVideoReady open never had a 0x0 confirmation to age
+            // against, so there is nothing meaningful to log here.
+            if (_playbackConfirmedTicks == 0) return;
+            var confirmedAgoSeconds = (DateTime.UtcNow.Ticks - _playbackConfirmedTicks) / TimeSpan.TicksPerSecond;
+            Log.Write("FFmpeg video size still 0x0 (pos=" + Math.Round(session.Position.TotalSeconds) + "s, confirmed " + confirmedAgoSeconds + "s ago)");
         }
 
         private void OnPlaybackStateChanged(MediaPlaybackSession sender, object args)
@@ -852,6 +1018,39 @@ namespace Nuvio.Playback
             // Keep the freshest position for failure logs even when the
             // progress event below is coalesced.
             _lastPositionSeconds = Math.Max(0, sender.Position.TotalSeconds);
+            // A2: one same-position seek if the open was confirmed by
+            // playback with no video size and the picture still has not
+            // appeared 15s later while the position keeps advancing — a
+            // nudge that can unstick a decoder/render path that never
+            // produced a first frame. Once only (atomic Exchange, last
+            // in the condition chain), generation-guarded, and never
+            // through the public Seek() (its log line would read as a
+            // user seek). Runs on every position event, unthrottled.
+            var seekNowTicks = DateTime.UtcNow.Ticks;
+            if (!_disposed && !_openFailed && _readySent && _playbackConfirmedTicks != 0 &&
+                sender.PlaybackState == MediaPlaybackState.Playing &&
+                sender.NaturalVideoWidth == 0 && sender.NaturalVideoHeight == 0 &&
+                seekNowTicks - _playbackConfirmedTicks >= TimeSpan.TicksPerSecond * 15 &&
+                sender.Position.TotalSeconds > _confirmedPositionSeconds &&
+                _confirmedGeneration == Interlocked.Read(ref _openGeneration) &&
+                Interlocked.Exchange(ref _videoSizeSeekDone, 1) == 0)
+            {
+                var confirmedAgoSeconds = (seekNowTicks - _playbackConfirmedTicks) / TimeSpan.TicksPerSecond;
+                Log.Write("FFmpeg black-screen recovery: same-position seek at pos=" + sender.Position.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s size=0x0 (confirmed " + confirmedAgoSeconds + "s ago, confirmedPos=" + _confirmedPositionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s)");
+                try
+                {
+                    var player = _mediaPlayer;
+                    if (player != null && ReferenceEquals(sender, player.PlaybackSession))
+                    {
+                        sender.Position = sender.Position;
+                        if (sender.NaturalVideoWidth != 0 && sender.NaturalVideoHeight != 0)
+                            Log.Write("FFmpeg black-screen recovery: size after seek=" + sender.NaturalVideoWidth + "x" + sender.NaturalVideoHeight + " (was 0x0, pos=" + Math.Round(sender.Position.TotalSeconds) + "s)");
+                        else
+                            Log.Write("FFmpeg black-screen recovery: size still 0x0 after seek (pos=" + Math.Round(sender.Position.TotalSeconds) + "s)");
+                    }
+                }
+                catch (Exception ex) { Log.Error("FFmpeg black-screen recovery seek failed", ex); }
+            }
             // Playback heartbeat: the only periodic proof the picture is
             // still advancing. FFmpegInteropX exposes no dropped-frame
             // counter (its public API is stream info only), and neither
@@ -871,6 +1070,7 @@ namespace Nuvio.Playback
                 var eventCount = Interlocked.Exchange(ref _positionChangedSinceHeartbeat, 0);
                 var lastGapMs = previousEventTicks == 0 ? -1 : (now.Ticks - previousEventTicks) / TimeSpan.TicksPerMillisecond;
                 LogHeartbeat(sender, eventCount, lastGapMs);
+                CheckVideoSizeAfterReady(sender);
             }
             // PositionChanged can fire several times per second. Coalesce progress updates so
             // the WebView bridge doesn't build a backlog on the Xbox renderer thread.
@@ -908,6 +1108,10 @@ namespace Nuvio.Playback
                     " download=" + Math.Round(session.DownloadProgress * 100) + "%" +
                     " events=" + eventCount +
                     " lastGap=" + (lastGapMs < 0 ? "n/a" : lastGapMs + "ms"));
+                // Memory every third heartbeat (~30s) for the slow
+                // deterioration / heavy-UI-after-many-films investigation.
+                if (Interlocked.Increment(ref _heartbeatCount) % 3 == 0)
+                    Log.Write(MemorySnapshot());
             }
             catch (Exception ex)
             {
@@ -947,7 +1151,9 @@ namespace Nuvio.Playback
             _lastErrorKind = args.Error.ToString();
             try { _lastPositionSeconds = Math.Max(0, sender.PlaybackSession.Position.TotalSeconds); }
             catch (Exception) { /* fall back to the last throttled position */ }
-            Log.Write("FFmpeg playback failed (" + args.Error + ") at " + Math.Round(_lastPositionSeconds) + "s: " + message);
+            var extended = args.ExtendedErrorCode;
+            var hr = extended == null ? "n/a" : "0x" + extended.HResult.ToString("X8");
+            Log.Write("FFmpeg playback failed (" + args.Error + ") at " + Math.Round(_lastPositionSeconds) + "s hr=" + hr + ": " + RedactUrls(message) + " " + MemorySnapshot());
             LogActualDecoder("failed");
             if (_openFailed || _disposed) return;
             _openFailed = true;
