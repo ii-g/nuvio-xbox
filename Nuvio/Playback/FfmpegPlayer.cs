@@ -64,6 +64,11 @@ namespace Nuvio.Playback
         private double _pausedKickPositionSeconds;
         private long _mediaPlayerCreated;
         private long _heartbeatCount;
+        private double _rateBaselinePositionSeconds;
+        private long _rateBaselineTicks;
+        private bool _rateBaselineValid;
+        private int _slowHeartbeatStreak;
+        private bool _slowRateLogged;
         private double _surfaceOpacity;
 
         public event Action<string, JsonObject> EventRaised;
@@ -177,6 +182,7 @@ namespace Nuvio.Playback
             _confirmedGeneration = 0;
             _pausedKickDone = 0;
             _pausedKickPositionSeconds = 0;
+            InvalidateRateBaseline();
             if (_view == null)
             {
                 FailOpen(generation, "The media player is not ready.", "PlayerNotReady");
@@ -681,6 +687,7 @@ namespace Nuvio.Playback
             {
                 var from = _mediaPlayer.PlaybackSession.Position.TotalSeconds;
                 _mediaPlayer.PlaybackSession.Position = TimeSpan.FromSeconds(seconds);
+                InvalidateRateBaseline();
                 Log.Write("FFmpeg seek: from=" + from.ToString("F1", CultureInfo.InvariantCulture) + "s to=" + seconds.ToString("F1", CultureInfo.InvariantCulture) + "s");
             }
             catch (Exception ex) { Log.Error("Seeking FFmpeg playback failed", ex); }
@@ -1001,6 +1008,12 @@ namespace Nuvio.Playback
         {
             // Playback callbacks may arrive after Stop() or on a media worker thread.
             if (_disposed || _openFailed) return;
+            // Leaving Playing (pause, buffering, stop) breaks the wall-clock
+            // continuity the rate check needs: the next heartbeat's interval
+            // would include non-playing time and read as slow playback.
+            // Invalidate the baseline so the first heartbeat after the
+            // return to Playing re-baselines instead of computing a rate.
+            if (sender.PlaybackState != MediaPlaybackState.Playing) InvalidateRateBaseline();
             if (sender.PlaybackState == MediaPlaybackState.Playing)
             {
                 SignalVideoReady(sender);
@@ -1110,6 +1123,7 @@ namespace Nuvio.Playback
                     " download=" + Math.Round(session.DownloadProgress * 100) + "%" +
                     " events=" + eventCount +
                     " lastGap=" + (lastGapMs < 0 ? "n/a" : lastGapMs + "ms"));
+                CheckSlowPlaybackRate(session);
                 // Memory every third heartbeat (~30s) for the slow
                 // deterioration / heavy-UI-after-many-films investigation.
                 if (Interlocked.Increment(ref _heartbeatCount) % 3 == 0)
@@ -1120,6 +1134,78 @@ namespace Nuvio.Playback
                 Log.Write("FFmpeg heartbeat: could not read session: " + ex.GetType().Name);
             }
         }
+
+        // Diagnostic only — no behaviour change: never fails, stops or
+        // alters playback, the watchdog or the open path. Measures the
+        // real advance rate from the position itself, never from
+        // PlaybackRate (which stays 1 even while the clock runs slow):
+        // (position now - position at the previous heartbeat) / wall
+        // seconds between the two heartbeats. Two consecutive heartbeats
+        // below 0.5x log one unmistakable line per slow episode; a
+        // heartbeat back at or above 0.5x closes the episode, so a
+        // later slow period logs again.
+        private void CheckSlowPlaybackRate(MediaPlaybackSession session)
+        {
+            var nowTicks = DateTime.UtcNow.Ticks;
+            var positionSeconds = session.Position.TotalSeconds;
+            if (!_rateBaselineValid)
+            {
+                // First heartbeat after an open, a seek, or a return to
+                // Playing: the interval behind this heartbeat includes
+                // start/resume/seek time, so it can never be a rate —
+                // establish the baseline and measure from the next one.
+                _rateBaselinePositionSeconds = positionSeconds;
+                _rateBaselineTicks = nowTicks;
+                _rateBaselineValid = true;
+                return;
+            }
+            var wallSeconds = (nowTicks - _rateBaselineTicks) / (double)TimeSpan.TicksPerSecond;
+            var deltaSeconds = positionSeconds - _rateBaselinePositionSeconds;
+            // Advance the baseline on every heartbeat so each rate covers
+            // exactly one heartbeat interval (~10s).
+            _rateBaselinePositionSeconds = positionSeconds;
+            _rateBaselineTicks = nowTicks;
+            // A backward jump is not slow playback, and a gap over 30s
+            // (3x the heartbeat period) proves position events went
+            // missing, so the interval mixes a stall with playing time:
+            // re-baseline instead of counting either as slow.
+            if (deltaSeconds < 0 || wallSeconds <= 0 || wallSeconds > 30)
+            {
+                _slowHeartbeatStreak = 0;
+                _slowRateLogged = false;
+                return;
+            }
+            if (deltaSeconds / wallSeconds < 0.5)
+            {
+                _slowHeartbeatStreak++;
+                if (_slowHeartbeatStreak >= 2 && !_slowRateLogged)
+                {
+                    _slowRateLogged = true;
+                    Log.Write("FFmpeg SLOW PLAYBACK RATE: rate=" + (deltaSeconds / wallSeconds).ToString("F3", CultureInfo.InvariantCulture) + "x pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s pageId=" + (_pageId ?? "n/a"));
+                }
+            }
+            else
+            {
+                _slowHeartbeatStreak = 0;
+                _slowRateLogged = false;
+            }
+        }
+
+        // Drops the rate baseline so the next heartbeat re-baselines
+        // instead of measuring across the gap. Called on every Open
+        // (new film/session), every Seek (position jump), and every
+        // transition out of Playing (pause/buffering/stop) — the three
+        // places a heartbeat interval would otherwise include time
+        // that is not continuous playback. The black-screen recovery
+        // same-position seek needs none of this: it sets Position to
+        // its own value, so no jump ever reaches the baseline.
+        private void InvalidateRateBaseline()
+        {
+            _rateBaselineValid = false;
+            _slowHeartbeatStreak = 0;
+            _slowRateLogged = false;
+        }
+
         private void OnBufferingStarted(MediaPlaybackSession sender, object args)
         {
             // BufferingStarted/BufferingEnded mark the exact start/end of
