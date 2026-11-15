@@ -293,8 +293,11 @@
         <!-- Seek bar button: transparent overlay over the track visuals
              (the fill/thumb/preview are siblings in the page, positioned by
              code-behind, because template parts are not reachable from here).
-             Focused: white 3 epx ring; the track grows and the thumb scales
-             via the page's GotFocus/LostFocus handlers. -->
+             No focus ring on this control by design: the white ring around
+             the thin track read as a second progress bar, so focus is shown
+             instead by the track/thumb growth in the page's GotFocus /
+             LostFocus handlers (taller, brighter track and bigger thumb).
+             The button stays fully focusable; only its ring is gone. -->
         <Style x:Key="SeekBarButtonStyle" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
             <Setter Property="Height" Value="21"/>
@@ -304,24 +307,7 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Grid Background="Transparent">
-                            <Border x:Name="FocusRing" BorderThickness="3" CornerRadius="4" Margin="-1" Opacity="0" IsHitTestVisible="False" BorderBrush="White"/>
-                            <VisualStateManager.VisualStateGroups>
-                                <VisualStateGroup x:Name="FocusStates">
-                                    <VisualState x:Name="Focused">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="FocusRing" Storyboard.TargetProperty="Opacity" To="1" Duration="0"/>
-                                        </Storyboard>
-                                    </VisualState>
-                                    <VisualState x:Name="Unfocused"/>
-                                    <VisualState x:Name="PointerFocused">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="FocusRing" Storyboard.TargetProperty="Opacity" To="1" Duration="0"/>
-                                        </Storyboard>
-                                    </VisualState>
-                                </VisualStateGroup>
-                            </VisualStateManager.VisualStateGroups>
-                        </Grid>
+                        <Grid Background="Transparent"/>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
