@@ -45,6 +45,9 @@ namespace Nuvio.Playback
         // imperceptible next to a seconds-long open; the queue is never
         // stalled longer than this by any single stop.
         private static readonly TimeSpan StopGrace = TimeSpan.FromMilliseconds(500);
+        private static readonly TimeSpan OpenTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan WatchdogTick = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan VlcStatsInterval = TimeSpan.FromSeconds(2);
         private static readonly TimeSpan TimeReportInterval = TimeSpan.FromMilliseconds(250);
         private static readonly TimeSpan ReadyFallbackDelay = TimeSpan.FromSeconds(2);
         private static readonly string[] AllowedSchemes = { "http", "https", "rtsp", "rtmp", "rtp", "udp", "mms", "ftp", "smb" };
@@ -70,6 +73,19 @@ namespace Nuvio.Playback
         // the player that replaced it (see QueueFromVlc/PostFromVlc).
         private long _playerEpoch;
 
+        // Open-watchdog state. The watchdog runs on its own timer task and
+        // reads managed fields only — never LibVLC: this class touches LibVLC
+        // on its serial worker only (see the class remarks), and the watchdog
+        // exists precisely for the case where that worker never runs, so it
+        // must not depend on the worker or on any LibVLC call to decide.
+        // _openFailedSeq holds the load seq whose terminal error was already
+        // raised (or -1); it is per-generation, so a stale watchdog can never
+        // poison a newer load, and no reset is needed when a load starts.
+        private long _openFailedSeq = -1;
+        // Last VoutCount seen on the worker; the UI-thread stats line reads
+        // this field instead of calling LibVLC off the worker.
+        private int _voutCount;
+
         // UI thread state.
         private long _loadSeq;
         private string _pageId;
@@ -92,7 +108,7 @@ namespace Nuvio.Playback
         private OpenRequest _request;
         private HttpMediaInput _input;
         private int _vlcLogLines;
-        private bool _hasPlayed;
+        private volatile bool _hasPlayed;
         private bool _inputStarted;
         private int _reconnects;
         private bool _wantPaused;
@@ -139,6 +155,16 @@ namespace Nuvio.Playback
 
         /// <summary>Raised when frames of the current stream start or stop being shown.</summary>
         public event Action<bool> VideoVisibleChanged;
+
+        /// <summary>
+        /// Optional UI-thread probe supplied by the hybrid player: given this
+        /// player's current MediaPlayer, describes the VideoView it should
+        /// render into (actual Opacity + whether that exact player is bound).
+        /// Read only on the UI thread, where LogVlcStats and MarkVideoReady
+        /// run; null when no view is bound. Diagnostic only — it never
+        /// changes playback, and a probe failure is logged, not thrown.
+        /// </summary>
+        public Func<MediaPlayer, string> ViewStateProbe { get; set; }
 
         /// <summary>The LibVLC version once it has started, otherwise null.</summary>
         public string Version { get; private set; }
@@ -388,6 +414,9 @@ namespace Nuvio.Playback
 
             Log.Write("Open " + Log.DescribeUrl(request.Url) + (request.StartSeconds > 0 ? " at " + Math.Round(request.StartSeconds) + "s" : ""));
             RaiseState("opening", null);
+            // The open watchdog is independent of the worker queue: it must
+            // still fire when the queued lambda below never runs.
+            _ = WatchVlcOpenAsync(seq);
             Enqueue(() =>
             {
                 if (!_ready.Wait(StartupTimeout) || _mediaPlayer == null)
@@ -641,6 +670,7 @@ namespace Nuvio.Playback
         // for the load that is waiting on it.
         private void ReportStartFailure(long seq)
         {
+            Interlocked.Exchange(ref _openFailedSeq, seq);
             var message = "VLC failed to start" + (_initError != null ? ": " + _initError : " (timed out).");
             Log.Write(message);
             RunOnUi(() =>
@@ -648,6 +678,88 @@ namespace Nuvio.Playback
                 if (seq == _loadSeq)
                 {
                     RaiseEnded("error", message);
+                }
+            });
+        }
+
+        // Open watchdog, mirroring FfmpegPlayer.WatchOpenTimeoutAsync: progress
+        // every 5 seconds, failure at 30 seconds. It runs on its own timer
+        // task and reads managed fields only (_hasPlayed, _lastTimeMs, the
+        // worker's load seq) — never LibVLC — so it still fires when the
+        // serial worker queue is stuck and the Open lambda never runs. The
+        // open is confirmed by the first tick that sees Playing with the
+        // position advanced past the previous tick, exactly like FFmpeg's
+        // ConfirmOpenByPlayback; _readySent ends the watch the same way
+        // FFmpeg's does. A frozen position after Playing is a failed open:
+        // a stream that reached Playing but never advanced proves nothing.
+        private async Task WatchVlcOpenAsync(long seq)
+        {
+            try
+            {
+                var previousTimeMs = Interlocked.Read(ref _lastTimeMs);
+                for (var elapsed = 5; elapsed <= (int)OpenTimeout.TotalSeconds; elapsed += 5)
+                {
+                    await Task.Delay(WatchdogTick).ConfigureAwait(false);
+                    if (_disposed || seq != _loadSeq || _readySent || Interlocked.Read(ref _openFailedSeq) == seq)
+                    {
+                        return;
+                    }
+                    // _workerLoadSeq only becomes seq when the Open lambda
+                    // reaches StartPlayback, so until then the worker has
+                    // not started this load at all — and _hasPlayed /
+                    // _lastTimeMs are still the previous load's. Refresh the
+                    // baseline while waiting so the first tick after the
+                    // worker reaches the load compares against fresh values.
+                    var workerReached = Interlocked.Read(ref _workerLoadSeq) == seq;
+                    var timeMs = Interlocked.Read(ref _lastTimeMs);
+                    if (workerReached && _hasPlayed && timeMs > previousTimeMs)
+                    {
+                        Log.Write("VLC open confirmed (playing at " + Math.Round(timeMs / 1000.0) + "s after " + elapsed + "s)");
+                        return;
+                    }
+                    previousTimeMs = timeMs;
+                    if (elapsed < (int)OpenTimeout.TotalSeconds)
+                    {
+                        Log.Write("VLC open still waiting (" + elapsed + "s/" + (int)OpenTimeout.TotalSeconds + "s, workerReached=" + workerReached +
+                            " played=" + _hasPlayed + " time=" + Math.Round(timeMs / 1000.0) + "s)");
+                    }
+                    else
+                    {
+                        FailVlcOpen(seq, "workerReached=" + workerReached + " played=" + _hasPlayed + " time=" + Math.Round(timeMs / 1000.0) + "s");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("VLC open watchdog failed", ex);
+            }
+        }
+
+        // Fails the open through the existing VLC error signal — the same
+        // "player.ended" error OnEncounteredError raises — so the hybrid
+        // player and the view model handle it exactly like any other VLC
+        // failure, with no new failure path: in auto mode the hybrid
+        // remembers the URL in _bothFailedUrls and the view model tries the
+        // next source; in forced-vlc mode nothing is remembered and the
+        // view model tries the next source with VLC again. The per-seq
+        // Exchange makes a second failure for the same load a no-op, and a
+        // late Playing/ready for this load is suppressed by the same mark.
+        // This only raises the failure: it does not stop VLC (a stop would
+        // queue behind the same stuck worker, or block this thread), so a
+        // stuck worker stays stuck until the queue fix lands — the open is
+        // bounded and loud instead of silent and endless.
+        private void FailVlcOpen(long seq, string detail)
+        {
+            if (Interlocked.Exchange(ref _openFailedSeq, seq) == seq)
+            {
+                return;
+            }
+            Log.Write("VLC open failed (OpenTimeout) after " + (int)OpenTimeout.TotalSeconds + "s (" + detail + ")");
+            RunOnUi(() =>
+            {
+                if (seq == _loadSeq)
+                {
+                    RaiseEnded("error", PlaybackErrorMessage);
                 }
             });
         }
@@ -766,6 +878,7 @@ namespace Nuvio.Playback
         private bool StopPlayer()
         {
             _input?.Abort();
+            _voutCount = 0;
             MediaPlayer player;
             HttpMediaInput input;
             Task stopTask;
@@ -1137,10 +1250,11 @@ namespace Nuvio.Playback
             RefreshTracks(seq);
 
             var hasVideoOutput = _mediaPlayer.VoutCount > 0;
+            _voutCount = _mediaPlayer.VoutCount;
             var paused = _wantPaused;
             RunOnUi(() =>
             {
-                if (seq != _loadSeq)
+                if (seq != _loadSeq || Interlocked.Read(ref _openFailedSeq) == seq)
                 {
                     return;
                 }
@@ -1170,13 +1284,14 @@ namespace Nuvio.Playback
             uint width = 0;
             uint height = 0;
             _mediaPlayer.Size(0, ref width, ref height);
+            _voutCount = _mediaPlayer.VoutCount;
             if (width > 0 && height > 0)
             {
                 Log.Write("VLC video output ready (" + width + "x" + height + ")");
             }
             RunOnUi(() =>
             {
-                if (seq != _loadSeq)
+                if (seq != _loadSeq || Interlocked.Read(ref _openFailedSeq) == seq)
                 {
                     return;
                 }
@@ -1205,6 +1320,10 @@ namespace Nuvio.Playback
             // A stream that ends before it ever played failed to open; reporting it as finished
             // would make the app move on to the next episode.
             var failedToOpen = !_hasPlayed;
+            if (failedToOpen)
+            {
+                Interlocked.Exchange(ref _openFailedSeq, seq);
+            }
             Log.Write(failedToOpen ? "Stream ended before it played (state=" + SafeState() + ")" : "Stream finished");
             RunOnUi(() =>
             {
@@ -1224,6 +1343,7 @@ namespace Nuvio.Playback
             {
                 return;
             }
+            Interlocked.Exchange(ref _openFailedSeq, seq);
             Log.Write("VLC could not play the stream (state=" + SafeState() + ") at " + Math.Round(Interlocked.Read(ref _lastTimeMs) / 1000.0) + "s");
             RunOnUi(() =>
             {
@@ -1452,7 +1572,10 @@ namespace Nuvio.Playback
             // own counters (decoded/displayed/lost pictures, lost audio
             // buffers, bitrates) come from Media.Statistics. A heartbeat
             // that stops arriving while Playing means time itself froze.
-            if (_hasPlayed && now - _lastVlcStatsLog >= TimeSpan.FromSeconds(10))
+            // 2 seconds while Playing, not 10: the decoded-vs-displayed
+            // gap is the second defect's signal, and a 10-second cadence
+            // leaves a short playback with one sample or none.
+            if (_hasPlayed && now - _lastVlcStatsLog >= VlcStatsInterval)
             {
                 _lastVlcStatsLog = now;
                 LogVlcStats(timeMs);
@@ -1462,7 +1585,12 @@ namespace Nuvio.Playback
         // UI thread. Media.Statistics wraps libvlc_media_get_stats; the
         // "--stats" option defaults to true in VLC, so the counters are
         // live while playing. All-zero counters while Playing would mean
-        // statistics are unavailable for this input.
+        // statistics are unavailable for this input. vout is the last
+        // VoutCount seen on the worker (read here as a managed field, never
+        // a LibVLC call off the worker); view is the hybrid player's probe
+        // of the VideoView — actual Opacity plus whether this exact player
+        // is bound to it. Decoded rising while displayed stays 0 with
+        // vout > 0 and opacity 1 is the decoded-without-display defect.
         private void LogVlcStats(long timeMs)
         {
             try
@@ -1477,7 +1605,8 @@ namespace Nuvio.Playback
                         " decodedVideo=" + stats.DecodedVideo + " displayed=" + stats.DisplayedPictures +
                         " lost=" + stats.LostPictures + " lostABuf=" + stats.LostAudioBuffers +
                         " inputBitrate=" + Math.Round(stats.InputBitrate) + " demuxBitrate=" + Math.Round(stats.DemuxBitrate) +
-                        " readBytes=" + stats.ReadBytes);
+                        " readBytes=" + stats.ReadBytes +
+                        " vout=" + _voutCount + " view=[" + ProbeViewState() + "]");
                 }
             }
             catch (Exception ex)
@@ -1486,14 +1615,39 @@ namespace Nuvio.Playback
             }
         }
 
+        // UI thread. Runs the hybrid player's view probe for the current
+        // player; never throws, so a broken probe cannot break playback.
+        private string ProbeViewState()
+        {
+            var probe = ViewStateProbe;
+            if (probe == null)
+            {
+                return "probe=none";
+            }
+            try
+            {
+                return probe(_mediaPlayer);
+            }
+            catch (Exception ex)
+            {
+                return "probe=error:" + ex.GetType().Name;
+            }
+        }
+
         private void MarkVideoReady(long seq, bool hasVideoOutput)
         {
-            if (seq != _loadSeq || _readySent)
+            if (seq != _loadSeq || _readySent || Interlocked.Read(ref _openFailedSeq) == seq)
             {
                 return;
             }
             _readySent = true;
-            Log.Write(hasVideoOutput ? "VLC video track ready" : "VLC ready (no video output yet)");
+            // The probe runs before VideoVisibleChanged applies the show:
+            // it answers whether this exact player was already bound to the
+            // view when readiness fired (the opacity it reports is the
+            // pre-show value; the hybrid player logs the applied opacity
+            // right after it sets it).
+            Log.Write((hasVideoOutput ? "VLC video track ready" : "VLC ready (no video output yet)") +
+                " [view: " + ProbeViewState() + "]");
             Raise("player.ready", new JsonObject());
             VideoVisibleChanged?.Invoke(true);
         }
