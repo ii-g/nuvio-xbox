@@ -700,14 +700,21 @@ namespace Nuvio.Views
         private void SeekBar_GotFocus(object sender, RoutedEventArgs e)
         {
             // Web .osd-seek.focused: taller track, bigger thumb.
-            SeekTrack.Height = 4;
-            SeekThumbScale.ScaleX = 1.3;
-            SeekThumbScale.ScaleY = 1.3;
+            // This is the seek bar's focus indicator (it has no focus
+            // ring by design): taller + brighter track and fill, and a
+            // bigger thumb, so focus stays visible without the ring.
+            SeekTrack.Height = 5;
+            SeekFill.Height = 5;
+            SeekTrack.Background = new SolidColorBrush(Color.FromArgb(0xBF, 0xFF, 0xFF, 0xFF));
+            SeekThumbScale.ScaleX = 1.6;
+            SeekThumbScale.ScaleY = 1.6;
         }
 
         private void SeekBar_LostFocus(object sender, RoutedEventArgs e)
         {
             SeekTrack.Height = 3;
+            SeekFill.Height = 3;
+            SeekTrack.Background = new SolidColorBrush(Color.FromArgb(0x47, 0xFF, 0xFF, 0xFF));
             SeekThumbScale.ScaleX = 1;
             SeekThumbScale.ScaleY = 1;
         }
