@@ -650,6 +650,36 @@
   <data name="SettingsPlaybackDescription" xml:space="preserve">
     <value>اللغات والاستئناف والحلقة التالية والمصادر</value>
   </data>
+  <data name="SettingsPlaybackEngine" xml:space="preserve">
+    <value>محرك التشغيل</value>
+  </data>
+  <data name="SettingsPlaybackEngineAuto" xml:space="preserve">
+    <value>تلقائي</value>
+  </data>
+  <data name="SettingsPlaybackEngineAutoDescription" xml:space="preserve">
+    <value>FFmpeg أولًا، وVLC احتياطيًا عند الفشل</value>
+  </data>
+  <data name="SettingsPlaybackEngineDescription" xml:space="preserve">
+    <value>اختر المحرك الذي يشغّل الفيديو. التلقائي يجرّب FFmpeg أولًا ثم VLC عند الفشل</value>
+  </data>
+  <data name="SettingsPlaybackEngineFfmpeg" xml:space="preserve">
+    <value>FFmpeg فقط</value>
+  </data>
+  <data name="SettingsPlaybackEngineFfmpegDescription" xml:space="preserve">
+    <value>لا يسقط إلى VLC أبدًا — للاختبار والمقارنة</value>
+  </data>
+  <data name="SettingsPlaybackEngineHint" xml:space="preserve">
+    <value>يسري التغيير على الفيلم التالي الذي تفتحه، لا على التشغيل الجاري</value>
+  </data>
+  <data name="SettingsPlaybackEngineVlc" xml:space="preserve">
+    <value>VLC فقط</value>
+  </data>
+  <data name="SettingsPlaybackEngineVlcDescription" xml:space="preserve">
+    <value>يشغّل بـ VLC من أول فتحة — للاختبار والمقارنة</value>
+  </data>
+  <data name="SettingsPlaybackTitle" xml:space="preserve">
+    <value>التشغيل</value>
+  </data>
   <data name="SettingsRefreshAddon" xml:space="preserve">
     <value>تحديث</value>
   </data>
