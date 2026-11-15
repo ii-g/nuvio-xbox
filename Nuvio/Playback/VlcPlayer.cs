@@ -1250,7 +1250,7 @@ namespace Nuvio.Playback
             RefreshTracks(seq);
 
             var hasVideoOutput = _mediaPlayer.VoutCount > 0;
-            _voutCount = _mediaPlayer.VoutCount;
+            _voutCount = (int)_mediaPlayer.VoutCount;
             var paused = _wantPaused;
             RunOnUi(() =>
             {
@@ -1284,7 +1284,7 @@ namespace Nuvio.Playback
             uint width = 0;
             uint height = 0;
             _mediaPlayer.Size(0, ref width, ref height);
-            _voutCount = _mediaPlayer.VoutCount;
+            _voutCount = (int)_mediaPlayer.VoutCount;
             if (width > 0 && height > 0)
             {
                 Log.Write("VLC video output ready (" + width + "x" + height + ")");
