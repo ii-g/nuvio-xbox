@@ -1,7 +1,7 @@
-<!-- Settings page (Milestone 6, Addons + Debrid only): root list, the Addons
-     section and the Debrid section. Ported from web/js/views/settings.js.
+<!-- Settings page (Milestone 6, Addons + Debrid + Playback): root list, the Addons
+     section, the Debrid section and the Playback section. Ported from web/js/views/settings.js.
      Every user-visible string is set in code-behind through S() (no literals
-     here); the root rows, addon cards and debrid rows are built imperatively
+     here); the root rows, addon cards, debrid rows and playback rows are built imperatively
      in code-behind so focus can be restored by key across re-renders.
      XYFocus keyboard navigation is off on purpose: the controller poll owns
      every move (see MainPage.OnPreviewKeyDown). -->
@@ -210,6 +210,14 @@
                 <TextBlock x:Name="DebridHint" Foreground="#B8FFFFFF" FontSize="9" TextWrapping="Wrap" shared:TextGlow.IsEnabled="True"/>
                 <TextBlock x:Name="DebridConnectHeader" FontSize="9" FontWeight="Bold" Foreground="#80FFFFFF" Margin="0,16,0,0" Visibility="Collapsed" shared:TextGlow.IsEnabled="True"/>
                 <StackPanel x:Name="DebridHost" Spacing="6" Margin="0,8,0,0"/>
+            </StackPanel>
+
+            <!-- Playback section. -->
+            <StackPanel x:Name="PlaybackPanel" Visibility="Collapsed" Margin="0,16,0,0">
+                <TextBlock x:Name="PlaybackHint" Foreground="#B8FFFFFF" FontSize="9" TextWrapping="Wrap" shared:TextGlow.IsEnabled="True"/>
+                <TextBlock x:Name="PlaybackEngineHeader" FontSize="9" FontWeight="Bold" Foreground="#80FFFFFF" Margin="0,16,0,0" shared:TextGlow.IsEnabled="True"/>
+                <StackPanel x:Name="PlaybackHost" Spacing="6" Margin="0,8,0,0"/>
+                <TextBlock x:Name="PlaybackEngineHint" Foreground="#B8FFFFFF" FontSize="9" TextWrapping="Wrap" Margin="0,12,0,0" shared:TextGlow.IsEnabled="True"/>
             </StackPanel>
         </StackPanel>
     </ScrollViewer>
