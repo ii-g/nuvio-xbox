@@ -53,6 +53,13 @@ namespace Nuvio.Playback
 
         public event Action<string, JsonObject> EventRaised;
 
+        /// <summary>
+        /// Raised on the UI thread when the VLC layer-2 surface replacement
+        /// is requested: the MainPage must unload and reload the VideoView.
+        /// Raised only while the VlcPlayer layer-2 flag is on.
+        /// </summary>
+        public event Action<long, long> VlcVideoSurfaceReloadRequested;
+
         public string Version { get; private set; } = "FFmpegInteropX + LibVLC";
 
         /// <summary>Binds the FFmpeg surface now; the VLC surface is bound when VLC starts.</summary>
@@ -75,6 +82,18 @@ namespace Nuvio.Playback
             // reported its options): push them to the live player too, so
             // the stored value is not the only place they take effect.
             if (_vlc != null) _vlc.ApplySwapChainOptions(options);
+        }
+
+        /// <summary>
+        /// Rebinds the hybrid player to a reloaded VLC VideoView (layer 2):
+        /// the old element was unloaded, so the stored view and its
+        /// attached player are stale. The FFmpeg surface is untouched.
+        /// </summary>
+        public void SetVlcView(VideoView vlcView)
+        {
+            _vlcView = vlcView;
+            _vlcAttachedPlayer = null;
+            if (_vlcView != null) _vlcView.Opacity = 0;
         }
 
         /// <summary>Marks the FFmpeg surface unusable (its creation failed).</summary>
@@ -204,7 +223,91 @@ namespace Nuvio.Playback
             {
                 _vlcAttachedPlayer = mediaPlayer;
                 if (_vlcView != null) _vlcView.MediaPlayer = mediaPlayer;
-                Log.Write("VLC VideoView MediaPlayer " + (_vlcView == null ? "not attached (no view)" : "attached"));
+                var stop = _vlc.LastAbandonedStop;
+                var boundToNew = _vlcView != null && ReferenceEquals(_vlcView.MediaPlayer, mediaPlayer);
+                var abandoned = _vlc.LastAbandonedPlayer;
+                var boundToOld = abandoned != null && _vlcView != null && ReferenceEquals(_vlcView.MediaPlayer, abandoned);
+                Log.Write("VLC VideoView MediaPlayer " + (_vlcView == null ? "not attached (no view)" : "attached") +
+                    " (stop=" + stop + " newEpoch=" + _vlc.PlayerEpoch + " viewBoundToNew=" + boundToNew + " viewBoundToOld=" + boundToOld + ")");
+            };
+            // Layer 1 of step 2a: detach the VideoView from a player whose
+            // stop outran StopGrace. Runs on the worker when the request
+            // arrives, then on the UI thread (the only thread that may touch
+            // the view). The reference guard is the rule: if the view was
+            // already rebound to a newer player, it is never touched.
+            // The managed detach itself changes no native reference
+            // (LibVLCSharp 3.10.1 Attach/Detach are empty); it cuts the
+            // managed binding and proves the detach happened in the log.
+            _vlc.VideoViewDetachRequested += request =>
+            {
+                Log.Write("VLC video view detach received (stop=" + request.StopSeq + " epoch=" + request.Epoch + ")");
+                try
+                {
+                    var ignored = _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                    {
+                        var started = DateTime.UtcNow;
+                        try
+                        {
+                            if (_vlcView == null)
+                            {
+                                Log.Write("VLC video view detach skipped (view=null, stop=" + request.StopSeq + " epoch=" + request.Epoch + ")");
+                                return;
+                            }
+                            if (!ReferenceEquals(_vlcView.MediaPlayer, request.AbandonedPlayer))
+                            {
+                                Log.Write("VLC video view detach skipped (view already bound to another player, stop=" + request.StopSeq + " epoch=" + request.Epoch + ")");
+                                return;
+                            }
+                            Log.Write("VLC stop detach detaching view from abandoned player (stop=" + request.StopSeq + " epoch=" + request.Epoch + " viewBoundToOld=True viewOpacity=" + _vlcView.Opacity.ToString(CultureInfo.InvariantCulture) + ")");
+                            _vlcView.MediaPlayer = null;
+                            _vlcAttachedPlayer = null;
+                            var boundAfter = ReferenceEquals(_vlcView.MediaPlayer, request.AbandonedPlayer);
+                            var took = (long)(DateTime.UtcNow - started).TotalMilliseconds;
+                            Log.Write("VLC stop detach detached view from abandoned player (stop=" + request.StopSeq + " epoch=" + request.Epoch + " viewBoundToOld=" + boundAfter + " took=" + took + "ms)");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error("VLC stop detach failed (stop=" + request.StopSeq + " epoch=" + request.Epoch + ")", ex);
+                        }
+                        finally
+                        {
+                            request.Completion.TrySetResult(null);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    // The dispatch itself failed: the request is lost, so
+                    // complete it here — otherwise the 2s watchdog would
+                    // report a late UI thread for a request that never ran.
+                    Log.Error("VLC stop detach failed (stop=" + request.StopSeq + " epoch=" + request.Epoch + ")", ex);
+                    request.Completion.TrySetResult(null);
+                }
+            };
+            // Layer 2 of step 2a: forward the surface-replacement request to
+            // the MainPage, which owns the VideoView element. Never raised
+            // while the VlcPlayer layer-2 flag is off.
+            _vlc.VideoSurfaceReplaceRequested += (stop, epoch) =>
+            {
+                Log.Write("VLC video surface replace received (stop=" + stop + " epoch=" + epoch + ")");
+                try
+                {
+                    var ignored = _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                    {
+                        try
+                        {
+                            VlcVideoSurfaceReloadRequested?.Invoke(stop, epoch);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error("VLC video surface replace failed", ex);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("VLC video surface replace failed", ex);
+                }
             };
             _vlc.VideoVisibleChanged += visible =>
             {
@@ -242,6 +345,14 @@ namespace Nuvio.Playback
                 if (_vlcView == null) return "view=null";
                 var bound = player != null && ReferenceEquals(_vlcView.MediaPlayer, player);
                 return "opacity=" + _vlcView.Opacity.ToString(CultureInfo.InvariantCulture) + " bound=" + bound;
+            };
+            // Diagnostic probe for the stop watcher: whether the view is
+            // bound to a given (abandoned) player. Runs on the UI thread
+            // only; never throws out of the player.
+            _vlc.ViewBoundToPlayer = player =>
+            {
+                if (_vlcView == null) return false;
+                return player != null && ReferenceEquals(_vlcView.MediaPlayer, player);
             };
             // LibVLC starts on a worker thread inside Initialize; Open() waits
             // for it (up to 20 s) before giving up, so a lazy start here only
