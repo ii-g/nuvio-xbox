@@ -177,7 +177,7 @@ namespace Nuvio.Services
         /// <summary>
         /// Settings page, section semantics (Fix 2, root cause D): a PLAIN
         /// PUSH — Back returns to wherever the section was opened from.
-        /// Section "addons" | "debrid" | null (null = root list pushed, not
+        /// Section "addons" | "debrid" | "playback" | null (null = root list pushed, not
         /// a root navigation; roots use NavigateSettingsRoot). The old
         /// version cleared the back stack on every call, destroying real
         /// back history: opening Addons from Home then pressing Back
