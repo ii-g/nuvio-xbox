@@ -130,6 +130,7 @@ namespace Nuvio.Services
                 StartSeconds = Math.Max(0, startSeconds),
                 Headers = StreamAnalysis.StreamHeaders(stream),
                 HardwareDecoding = _settings.GetBool("hardwareDecoding", true),
+                EngineMode = _settings.PlaybackEngine,
             };
             _currentOpenId = request.Id;
             _currentTime = request.StartSeconds;
