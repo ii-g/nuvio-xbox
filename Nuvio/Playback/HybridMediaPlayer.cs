@@ -44,6 +44,7 @@ namespace Nuvio.Playback
         private string _pageId;
         private double _lastTimeSeconds;
         private bool _fellBack;
+        private string _openEngineMode = "auto";
 
         private readonly HashSet<string> _primaryFailedUrls = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _bothFailedUrls = new HashSet<string>(StringComparer.Ordinal);
@@ -89,6 +90,14 @@ namespace Nuvio.Playback
             if (_vlc != null) _vlc.SetUnavailable(reason);
         }
 
+        /// <summary>Normalizes the requested engine mode: only "ffmpeg" and
+        /// "vlc" force an engine; null or anything else means automatic.</summary>
+        private static string Mode(OpenRequest request)
+        {
+            var mode = request == null ? null : request.EngineMode;
+            return mode == "ffmpeg" || mode == "vlc" ? mode : "auto";
+        }
+
         public void Open(OpenRequest request)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(HybridMediaPlayer));
@@ -96,6 +105,7 @@ namespace Nuvio.Playback
             _pageId = request == null ? null : request.Id;
             _lastTimeSeconds = request == null ? 0 : Math.Max(0, request.StartSeconds);
             _fellBack = false;
+            _openEngineMode = Mode(request);
             if (request == null || string.IsNullOrEmpty(request.Url))
             {
                 OpenWithPrimary(request);
@@ -106,6 +116,23 @@ namespace Nuvio.Playback
                 Log.Write("Skipping source both players already failed to play (host " + HostOf(request.Url) + ")");
                 RaiseState("error", "Neither FFmpeg nor VLC could play this stream.");
                 RaiseEnded("error", "Neither FFmpeg nor VLC could play this stream.");
+                return;
+            }
+            if (_openEngineMode == "vlc")
+            {
+                Log.Write("Playback engine forced to VLC (host " + HostOf(request.Url) + ")");
+                // A previous open in this player lifetime may still have FFmpeg
+                // playing: PlayerViewModel.Start re-opens without stopping the
+                // player (its Report("stop") is playback reporting, not a
+                // player stop), and OpenWithVlc never stops the primary — so
+                // stop it here first, mirroring the VLC stop in OpenWithPrimary.
+                try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg for a VLC open failed", ex); }
+                OpenWithVlc(request, _lastTimeSeconds, true);
+                return;
+            }
+            if (_openEngineMode == "ffmpeg")
+            {
+                OpenWithPrimary(request);
                 return;
             }
             if (_primaryFailedUrls.Contains(request.Url))
@@ -206,7 +233,10 @@ namespace Nuvio.Playback
             if (type == "player.ended" && GetString(payload, "reason") == "error")
             {
                 var url = _currentRequest == null ? null : _currentRequest.Url;
-                if (!string.IsNullOrEmpty(url))
+                // Only automatic mode remembers failures: a forced-VLC failure
+                // must not poison automatic mode (returning to auto would
+                // refuse a source VLC alone failed) or vice versa.
+                if (_openEngineMode == "auto" && !string.IsNullOrEmpty(url))
                 {
                     _bothFailedUrls.Add(url);
                     CapRememberedUrls();
@@ -217,6 +247,16 @@ namespace Nuvio.Playback
 
         private void TryFallbackToVlc(JsonObject primaryEnded)
         {
+            // A forced-FFmpeg open never falls back: report the failure as-is,
+            // and record nothing — a forced failure must not poison automatic
+            // mode (returning to auto would start with VLC for a source
+            // FFmpeg alone failed). No silent fallback to VLC either: the
+            // explicit failure is the point of the forced mode.
+            if (_openEngineMode == "ffmpeg")
+            {
+                EventRaised?.Invoke("player.ended", primaryEnded);
+                return;
+            }
             // Nothing to fall back to without a URL (e.g. an empty link the
             // primary player already rejected): report the failure as-is.
             if (_currentRequest == null || string.IsNullOrEmpty(_currentRequest.Url))
@@ -231,7 +271,8 @@ namespace Nuvio.Playback
             }
             _fellBack = true;
             var url = _currentRequest == null ? null : _currentRequest.Url;
-            if (!string.IsNullOrEmpty(url))
+            // Only automatic mode remembers a primary failure (see above).
+            if (_openEngineMode == "auto" && !string.IsNullOrEmpty(url))
             {
                 _primaryFailedUrls.Add(url);
                 CapRememberedUrls();
