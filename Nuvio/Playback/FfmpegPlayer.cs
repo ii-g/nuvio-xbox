@@ -320,7 +320,9 @@ namespace Nuvio.Playback
             options["timeout"] = "10000000";
             options["stimeout"] = "10000000";
             config.General.ReadAheadBufferEnabled = true;
-            config.General.ReadAheadBufferDuration = TimeSpan.FromSeconds(10);
+            config.General.ReadAheadBufferDuration = TimeSpan.FromSeconds(30);
+            config.General.ReadAheadBufferSize = 100 * 1024 * 1024;
+            Log.Write("FFmpeg read-ahead buffer configured: duration=30s size=100MB (104857600 bytes)");
             config.Video.VideoDecoderMode = request != null && request.HardwareDecoding
                 ? VideoDecoderMode.Automatic
                 : VideoDecoderMode.ForceFFmpegSoftwareDecoder;
