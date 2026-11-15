@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using LibVLCSharp.Platforms.Windows;
 using Nuvio.Diagnostics;
 using Windows.Data.Json;
@@ -34,6 +35,7 @@ namespace Nuvio.Playback
         private readonly FfmpegPlayer _primary = new FfmpegPlayer();
         private VlcPlayer _vlc;
         private VideoView _vlcView;
+        private LibVLCSharp.Shared.MediaPlayer _vlcAttachedPlayer;
         private CoreDispatcher _dispatcher;
         private string[] _vlcSwapChainOptions;
         private bool _vlcUnavailable;
@@ -200,11 +202,31 @@ namespace Nuvio.Playback
             _vlc.EventRaised += OnVlcEvent;
             _vlc.MediaPlayerCreated += mediaPlayer =>
             {
+                _vlcAttachedPlayer = mediaPlayer;
                 if (_vlcView != null) _vlcView.MediaPlayer = mediaPlayer;
+                Log.Write("VLC VideoView MediaPlayer " + (_vlcView == null ? "not attached (no view)" : "attached"));
             };
             _vlc.VideoVisibleChanged += visible =>
             {
                 if (_vlcView != null) _vlcView.Opacity = visible ? 1 : 0;
+                // Log the applied state, not the request: this runs inside
+                // MarkVideoReady's invoke, so the opacity here is the real
+                // post-show value and the binding check is against the
+                // player attached above.
+                var bound = _vlcView != null && _vlcAttachedPlayer != null &&
+                    ReferenceEquals(_vlcView.MediaPlayer, _vlcAttachedPlayer);
+                Log.Write("VLC video view: visible=" + visible +
+                    " opacity=" + (_vlcView == null ? "no-view" : _vlcView.Opacity.ToString(CultureInfo.InvariantCulture)) +
+                    " bound=" + bound);
+            };
+            // Diagnostic probe for the player's stats/ready lines: actual
+            // Opacity plus whether the view holds this exact player. Runs
+            // on the UI thread only; never throws out of the player.
+            _vlc.ViewStateProbe = player =>
+            {
+                if (_vlcView == null) return "view=null";
+                var bound = player != null && ReferenceEquals(_vlcView.MediaPlayer, player);
+                return "opacity=" + _vlcView.Opacity.ToString(CultureInfo.InvariantCulture) + " bound=" + bound;
             };
             // LibVLC starts on a worker thread inside Initialize; Open() waits
             // for it (up to 20 s) before giving up, so a lazy start here only
@@ -441,6 +463,7 @@ namespace Nuvio.Playback
                 _vlc.Dispose();
                 _vlc = null;
             }
+            _vlcAttachedPlayer = null;
             _vlcView = null;
         }
     }
