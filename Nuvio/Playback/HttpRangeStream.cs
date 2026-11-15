@@ -163,12 +163,14 @@ namespace Nuvio.Playback
             if (offset < 0 || count < 0 || offset + count > buffer.Length) throw new ArgumentOutOfRangeException();
             if (count == 0 || _position >= Length) return 0;
 
+            var gateStart = Environment.TickCount;
             await _readGate.WaitAsync(cancellationToken);
+            var gateWaitMs = Environment.TickCount - gateStart;
             try
             {
                 if (_position >= Length) return 0;
                 if (_responseStream == null || _position != _responsePosition || _position >= _responseEnd)
-                    await OpenRangeAsync(cancellationToken);
+                    await OpenRangeAsync(cancellationToken, gateWaitMs);
 
                 var available = (int)Math.Min(count, Math.Min(int.MaxValue, _responseEnd - _position));
                 if (available <= 0) return 0;
@@ -183,7 +185,7 @@ namespace Nuvio.Playback
             }
         }
 
-        private async Task OpenRangeAsync(CancellationToken token)
+        private async Task OpenRangeAsync(CancellationToken token, int gateWaitMs)
         {
             CloseResponse();
             var start = _position;
@@ -194,7 +196,10 @@ namespace Nuvio.Playback
 
             try
             {
+                var getStart = Environment.TickCount;
                 response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                var getMs = Environment.TickCount - getStart;
+                Log.Write("FFmpeg range read: bytes=" + start + "-" + end + " getMs=" + getMs + " gateWaitMs=" + gateWaitMs);
                 request.Dispose();
                 if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
