@@ -648,6 +648,36 @@
   <data name="SettingsPlaybackDescription" xml:space="preserve">
     <value>Languages, resume, next episode, streams</value>
   </data>
+  <data name="SettingsPlaybackEngine" xml:space="preserve">
+    <value>Playback engine</value>
+  </data>
+  <data name="SettingsPlaybackEngineAuto" xml:space="preserve">
+    <value>Automatic</value>
+  </data>
+  <data name="SettingsPlaybackEngineAutoDescription" xml:space="preserve">
+    <value>FFmpeg first, VLC as fallback on failure</value>
+  </data>
+  <data name="SettingsPlaybackEngineDescription" xml:space="preserve">
+    <value>Choose which engine plays video. Automatic tries FFmpeg first, then VLC on failure</value>
+  </data>
+  <data name="SettingsPlaybackEngineFfmpeg" xml:space="preserve">
+    <value>FFmpeg only</value>
+  </data>
+  <data name="SettingsPlaybackEngineFfmpegDescription" xml:space="preserve">
+    <value>Never falls back to VLC — for testing and comparison</value>
+  </data>
+  <data name="SettingsPlaybackEngineHint" xml:space="preserve">
+    <value>Applies to the next film you open, not to playback already running</value>
+  </data>
+  <data name="SettingsPlaybackEngineVlc" xml:space="preserve">
+    <value>VLC only</value>
+  </data>
+  <data name="SettingsPlaybackEngineVlcDescription" xml:space="preserve">
+    <value>Plays with VLC from the first open — for testing and comparison</value>
+  </data>
+  <data name="SettingsPlaybackTitle" xml:space="preserve">
+    <value>Playback</value>
+  </data>
   <data name="SettingsRefreshAddon" xml:space="preserve">
     <value>Refresh</value>
   </data>
