@@ -208,16 +208,31 @@ namespace Nuvio.Playback
             };
             _vlc.VideoVisibleChanged += visible =>
             {
-                if (_vlcView != null) _vlcView.Opacity = visible ? 1 : 0;
+                var clearState = "skipped";
+                if (_vlcView != null)
+                {
+                    _vlcView.Opacity = visible ? 1 : 0;
+                    if (!visible)
+                    {
+                        // Opacity 0 only hides the surface: the last frame of
+                        // the previous film stays in the swap chain and shows
+                        // again as soon as Opacity returns to 1. Clear() wipes
+                        // it with an explicit black present (a no-op before
+                        // the view loads), so nothing stale is visible between
+                        // the stop and the new stream's first frame.
+                        try { _vlcView.Clear(); clearState = "invoked"; }
+                        catch (Exception ex) { clearState = "failed"; Log.Error("Clearing the VLC video view failed", ex); }
+                    }
+                }
                 // Log the applied state, not the request: this runs inside
-                // MarkVideoReady's invoke, so the opacity here is the real
-                // post-show value and the binding check is against the
-                // player attached above.
+                // the player's show invoke (first presented frame), so the
+                // opacity here is the real post-show value and the binding
+                // check is against the player attached above.
                 var bound = _vlcView != null && _vlcAttachedPlayer != null &&
                     ReferenceEquals(_vlcView.MediaPlayer, _vlcAttachedPlayer);
                 Log.Write("VLC video view: visible=" + visible +
                     " opacity=" + (_vlcView == null ? "no-view" : _vlcView.Opacity.ToString(CultureInfo.InvariantCulture)) +
-                    " bound=" + bound);
+                    " bound=" + bound + " clear=" + clearState);
             };
             // Diagnostic probe for the player's stats/ready lines: actual
             // Opacity plus whether the view holds this exact player. Runs
