@@ -619,6 +619,12 @@ namespace Nuvio
 
         private void VideoView_SizeChanged(object sender, SizeChangedEventArgs e)
         {
+            // Diagnostic: the view's actual laid-out size, on the first
+            // SizeChanged and every later one, so the next log shows whether
+            // it was ever zero (or unexpected) when a vout failed to resize
+            // its back buffer. No behaviour change: the size is still only
+            // forwarded to the player for video scaling.
+            Log.Write("VLC video view size: " + e.NewSize.Width + "x" + e.NewSize.Height);
             _player.SetViewSize(e.NewSize.Width, e.NewSize.Height);
         }
 
