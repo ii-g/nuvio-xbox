@@ -36,6 +36,8 @@ namespace Nuvio.Playback
         private readonly CoreDispatcher _dispatcher;
         private readonly object _queueLock = new object();
         private Task _queue = Task.CompletedTask;
+        // Logging-only diagnostic: items enqueued on the serial worker but not yet started.
+        private int _queueDepth;
 
         // UI thread state.
         private long _loadSeq;
@@ -384,7 +386,9 @@ namespace Nuvio.Playback
             var seq = _loadSeq;
             Enqueue(() =>
             {
+                Log.Write("VLC stop requested (worker)");
                 StopPlayer();
+                Log.Write("VLC stop done");
                 Interlocked.Exchange(ref _workerLoadSeq, seq);
                 _request = null;
                 _hasPlayed = false;
@@ -599,6 +603,7 @@ namespace Nuvio.Playback
         // Worker: (re)opens the current request, resuming at startSeconds.
         private void StartPlayback(double startSeconds)
         {
+            Log.Write("VLC StartPlayback entered (workerLoadSeq=" + Interlocked.Read(ref _workerLoadSeq) + ")");
             StopPlayer();
             _inputStarted = false;
             Interlocked.Exchange(ref _lastTimeMs, (long)(startSeconds * 1000));
@@ -1224,10 +1229,13 @@ namespace Nuvio.Playback
 
         private void Enqueue(Action action)
         {
+            int depth;
             lock (_queueLock)
             {
+                depth = Interlocked.Increment(ref _queueDepth);
                 _queue = _queue.ContinueWith(_ =>
                 {
+                    Interlocked.Decrement(ref _queueDepth);
                     try
                     {
                         action();
@@ -1238,6 +1246,7 @@ namespace Nuvio.Playback
                     }
                 }, TaskScheduler.Default);
             }
+            Log.Write("VLC worker enqueue depth=" + depth);
         }
 
         private void RunOnUi(Action action)
