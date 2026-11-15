@@ -149,6 +149,7 @@ namespace Nuvio
             // stored tag (build 162: Arabic labels, yet the strip landed on the left).
             SetFlowDirection(AppSettings.EffectiveIsRightToLeft());
             _player = new HybridMediaPlayer();
+            _player.VlcVideoSurfaceReloadRequested += ReloadVlcVideoView;
             // The page has its own focus navigation for the controller; the console's mouse-mode
             // cursor would only get in the way.
             SetPointerMode(false);
@@ -586,10 +587,7 @@ namespace Nuvio
             }
             try
             {
-                Log.Write("Creating the VLC video surface");
-                FindName(nameof(VideoView));
-                vlcView = VideoView;
-                VideoView.Initialized += VideoView_Initialized;
+                vlcView = CreateVlcVideoView();
             }
             catch (Exception ex)
             {
@@ -609,6 +607,63 @@ namespace Nuvio
                 Log.Error("Creating the media surfaces failed", ex);
                 _player.SetUnavailable("the media surface could not be created (" + ex.Message + ")");
             }
+        }
+
+        // Realizes the VLC VideoView (x:Load element) and subscribes to its
+        // Initialized event, which delivers the new swap-chain options.
+        // Guard-free: the caller owns the once-only guard (CreateVideoView)
+        // or the reload decision (ReloadVlcVideoView). Extracted rather
+        // than resetting _videoViewRequested for a reload: resetting it
+        // would let a later CreateVideoView() call re-initialize the hybrid
+        // player and double-subscribe its events.
+        private VideoView CreateVlcVideoView()
+        {
+            Log.Write("Creating the VLC video surface");
+            FindName(nameof(VideoView));
+            var vlcView = VideoView;
+            VideoView.Initialized += VideoView_Initialized;
+            return vlcView;
+        }
+
+        // Layer 2 of step 2a (flag-off by default in VlcPlayer): unload the
+        // VideoView — Unloaded destroys its swap chain inside LibVLCSharp —
+        // and reload it, so the next LibVLC instance renders into a fresh
+        // chain instead of the one the abandoned vout still references.
+        // Runs on the UI thread (raised through the hybrid player's
+        // dispatcher). If the unload or the reload fails, layer 2 stops
+        // here: the old view is left in place and the failure is logged;
+        // playback continues on the old chain exactly as before.
+        private void ReloadVlcVideoView(long stopSeq, long epoch)
+        {
+            Log.Write("VLC video surface unload requested (stop=" + stopSeq + " epoch=" + epoch + ")");
+            var started = DateTime.UtcNow;
+            try
+            {
+                if (VideoView != null) XamlMarkupHelper.UnloadObject(VideoView);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("VLC video surface reload failed", ex);
+                return;
+            }
+            var unloadTook = (long)(DateTime.UtcNow - started).TotalMilliseconds;
+            Log.Write("VLC video surface unloaded (stop=" + stopSeq + " epoch=" + epoch + " took=" + unloadTook + "ms)");
+            VideoView reloaded;
+            try
+            {
+                reloaded = CreateVlcVideoView();
+            }
+            catch (Exception ex)
+            {
+                Log.Error("VLC video surface reload failed", ex);
+                return;
+            }
+            // The hybrid player still holds the unloaded element: point it
+            // at the new one (and clear its attached-player record) before
+            // the new Initialized event delivers fresh swap-chain options.
+            _player.SetVlcView(reloaded);
+            var took = (long)(DateTime.UtcNow - started).TotalMilliseconds;
+            Log.Write("VLC video surface reloaded (stop=" + stopSeq + " epoch=" + epoch + " took=" + took + "ms)");
         }
 
         private void VideoView_Initialized(object sender, InitializedEventArgs e)
