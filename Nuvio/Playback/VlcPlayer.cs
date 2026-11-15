@@ -18,8 +18,11 @@ namespace Nuvio.Playback
     /// </summary>
     /// <remarks>
     /// Public members must be called on the UI thread, and events are raised on it. LibVLC is only
-    /// touched on a private serial worker, because calls like Stop() block until VLC's threads exit,
-    /// and LibVLC must never be called from inside one of its own event callbacks.
+    /// touched on a private serial worker — except MediaPlayer.Stop(), which runs on a dedicated
+    /// stop thread per request (see StopPlayer): Stop() is synchronous and blocks until VLC's
+    /// threads exit, so running it on the worker let one stop during Opening stall the queue
+    /// forever. LibVLC must never be called from inside one of its own event callbacks; the stop
+    /// thread is a plain background thread, not a callback thread.
     /// </remarks>
     internal sealed class VlcPlayer : IDisposable
     {
@@ -29,6 +32,19 @@ namespace Nuvio.Playback
         private const long EarlyEndToleranceMs = 60000;
         private const string PlaybackErrorMessage = "VLC could not play this stream.";
         private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(20);
+        // A stop that has not returned after this long is declared dead: the
+        // player is abandoned (replaced before the next play) and the stop
+        // thread is left to finish on its own. 5s is far above a healthy stop
+        // (the input thread exits in milliseconds once asked) and far below
+        // the 35s UI open timer, so recovery never waits on it. It is a
+        // diagnostic horizon only: recovery happens at StopGrace, below.
+        private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(5);
+        // How long the serial worker waits for a stop before giving up on
+        // the player instead. A healthy stop returns in milliseconds, so
+        // 500ms is generous headroom for a loaded Xbox and still
+        // imperceptible next to a seconds-long open; the queue is never
+        // stalled longer than this by any single stop.
+        private static readonly TimeSpan StopGrace = TimeSpan.FromMilliseconds(500);
         private static readonly TimeSpan TimeReportInterval = TimeSpan.FromMilliseconds(250);
         private static readonly TimeSpan ReadyFallbackDelay = TimeSpan.FromSeconds(2);
         private static readonly string[] AllowedSchemes = { "http", "https", "rtsp", "rtmp", "rtp", "udp", "mms", "ftp", "smb" };
@@ -38,6 +54,21 @@ namespace Nuvio.Playback
         private Task _queue = Task.CompletedTask;
         // Logging-only diagnostic: items enqueued on the serial worker but not yet started.
         private int _queueDepth;
+
+        // Stop-thread state. The blocking MediaPlayer.Stop() never runs on
+        // the serial worker (see StopPlayer); one dedicated thread per stop
+        // request runs it, and the bookkeeping below is guarded by _stopLock.
+        private readonly object _stopLock = new object();
+        private Task _stopTask;            // outstanding stop, else null
+        private MediaPlayer _stopPlayer;   // player the outstanding stop targets
+        private int _stopsInFlight;        // stop tasks issued and not yet finished
+        private bool _playerPoisoned;      // current _mediaPlayer had a stop that outran StopGrace
+        private bool _disposePending;      // Dispose() was called while a stop was running
+        // Generation of the live MediaPlayer, bumped on every (re)creation.
+        // VLC events carry the epoch they were raised under; a late event
+        // from an abandoned player must never be mistaken for an event of
+        // the player that replaced it (see QueueFromVlc/PostFromVlc).
+        private long _playerEpoch;
 
         // UI thread state.
         private long _loadSeq;
@@ -195,8 +226,10 @@ namespace Nuvio.Playback
         }
 
         // Worker. Re-creates LibVLC with the stored swap-chain options, if it was started
-        // without them. Call only after playback has been stopped: StopPlayer has already run
-        // in Stop/Open, and ApplySwapChainOptionsOnWorker checks for active playback itself.
+        // without them. Call only while idle: the callers in Stop/Open have already asked
+        // for a stop, and this method itself refuses to run while one is still outstanding
+        // (a stop thread owns the player until Stop() returns). ApplySwapChainOptionsOnWorker
+        // checks for active playback itself.
         // The new MediaPlayer is published through MediaPlayerCreated (inside CreateLibVlc),
         // so the VideoView re-attaches; volume/mute/rate/track preferences live in fields
         // and are re-applied when the next stream plays.
@@ -216,7 +249,15 @@ namespace Nuvio.Playback
                 }
             }
             Log.Write("Recreating LibVLC with the video surface swap-chain options");
-            StopPlayer();
+            // Never dispose the player while its stop is still running: the
+            // stop thread owns it until Stop() returns. The re-create is
+            // deferred, not lost — the stored options are kept and the next
+            // Stop or Open retries it.
+            if (IsStopOutstanding())
+            {
+                Log.Write("LibVLC re-create deferred: a stop is still running");
+                return;
+            }
             if (_libVlc != null)
             {
                 _libVlc.Log -= OnLibVlcLog;
@@ -263,6 +304,7 @@ namespace Nuvio.Playback
                 _libVlc = new LibVLC(false, options.ToArray());
 #endif
                 _mediaPlayer = new MediaPlayer(_libVlc);
+                Interlocked.Increment(ref _playerEpoch);
                 Subscribe(_mediaPlayer);
                 _libVlc.Log += OnLibVlcLog;
                 lock (_swapChainLock)
@@ -371,7 +413,11 @@ namespace Nuvio.Playback
                 _wantPaused = false;
                 _wantAudioTrack = null;
                 _wantSpuTrack = null;
-                StartPlayback(request.StartSeconds);
+                if (!StartPlayback(request.StartSeconds))
+                {
+                    ReportStartFailure(seq);
+                    return;
+                }
             });
         }
 
@@ -567,7 +613,23 @@ namespace Nuvio.Playback
             VideoVisibleChanged = null;
             Enqueue(() =>
             {
-                StopPlayer();
+                if (!StopPlayer())
+                {
+                    // A stop is still running: disposing the player or the
+                    // instance now would block on the same stuck input thread
+                    // the stop is waiting for. Defer the teardown to the stop
+                    // thread (see RunStop): it disposes the player and the
+                    // instance when the stop returns — or never, if it never
+                    // returns, in which case the leak is bounded to this
+                    // player until the process exits, and the 5s watchdog
+                    // has logged it.
+                    lock (_stopLock)
+                    {
+                        _disposePending = true;
+                    }
+                    Log.Write("VLC dispose deferred: a stop is still running");
+                    return;
+                }
                 _mediaPlayer?.Dispose();
                 _mediaPlayer = null;
                 _libVlc?.Dispose();
@@ -601,10 +663,26 @@ namespace Nuvio.Playback
         }
 
         // Worker: (re)opens the current request, resuming at startSeconds.
-        private void StartPlayback(double startSeconds)
+        // Returns false only when there is no usable player at all (the
+        // player had to be replaced after an abandoned stop and the
+        // replacement failed); the caller then reports a start failure.
+        private bool StartPlayback(double startSeconds)
         {
             Log.Write("VLC StartPlayback entered (workerLoadSeq=" + Interlocked.Read(ref _workerLoadSeq) + ")");
-            StopPlayer();
+            if (IsPlayerStuck() || !StopPlayer())
+            {
+                // A stop is still running for this player (or just outran the
+                // grace): playing on it would let the late Stop() kill the new
+                // stream as soon as it lands. Play on a fresh player instead;
+                // the old one stays owned by its stop thread and is reclaimed
+                // when Stop() returns. If the replacement fails but the stop
+                // finished in the meantime, the live player is stopped and
+                // usable again — play on it.
+                if (!RecreatePlayer() && IsPlayerStuck())
+                {
+                    return false;
+                }
+            }
             _inputStarted = false;
             Interlocked.Exchange(ref _lastTimeMs, (long)(startSeconds * 1000));
             var options = new List<string>
@@ -660,15 +738,267 @@ namespace Nuvio.Playback
                 var accepted = _mediaPlayer.Play(media);
                 Log.Write("VLC play requested (accepted=" + accepted + " state=" + SafeState() + ")");
             }
+            return true;
         }
 
-        // Worker. Stops playback; a pending download is broken off first so Stop doesn't wait on it.
-        private void StopPlayer()
+        // Worker. Asks for playback to stop without ever blocking this
+        // serial queue on VLC. _input.Abort() runs here (fast: it only
+        // closes the pending response, which breaks a pending read), while
+        // the blocking MediaPlayer.Stop() runs on a dedicated stop thread.
+        //
+        // Why a thread, not the queue: LibVLCSharp documents Stop() as
+        // synchronous — "will block until all VLC threads have been joined"
+        // — and a stop issued during Opening (moov parse) can therefore
+        // never return. On the queue that killed every later open; on its
+        // own thread it only costs one thread. Stop() is never called from
+        // a VLC callback (the one deadlock the docs warn about), touches
+        // no UI object, and two threads never stop the same player: issue
+        // is serialised on this queue, and a second request for a player
+        // that already has a stop running joins the running one.
+        //
+        // The queue waits at most StopGrace for the common fast stop, so a
+        // new stream can still Play on the same player right after a normal
+        // stop. If the stop outruns the grace, this returns false and the
+        // player is poisoned: the caller must replace it (RecreatePlayer)
+        // before playing, so the late Stop() can never kill the new stream.
+        // Returns true when the player is stopped (or there was nothing to
+        // stop), false when a stop is still in flight.
+        private bool StopPlayer()
         {
             _input?.Abort();
-            _mediaPlayer?.Stop();
-            _input?.Dispose();
-            _input = null;
+            MediaPlayer player;
+            HttpMediaInput input;
+            Task stopTask;
+            lock (_stopLock)
+            {
+                player = _mediaPlayer;
+                input = _input;
+                _input = null;
+                if (player == null)
+                {
+                    input?.Dispose();
+                    return true;
+                }
+                if (_stopPlayer == player && _stopTask != null && !_stopTask.IsCompleted)
+                {
+                    // A stop for this same player is already running; joining
+                    // it instead of calling Stop() a second time.
+                    stopTask = _stopTask;
+                }
+                else
+                {
+                    var started = DateTime.UtcNow;
+                    stopTask = Task.Factory.StartNew(() => RunStop(player, input, started),
+                        CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                    _stopPlayer = player;
+                    _stopTask = stopTask;
+                    _stopsInFlight++;
+                    Log.Write("VLC stop requested (state=" + SafeState() + ")");
+                    // Diagnostic horizon only: recovery already happened (or
+                    // was refused) at StopGrace; this line just says the stop
+                    // is still stuck long after any healthy stop would have
+                    // returned.
+                    var ignored = Task.Delay(StopTimeout).ContinueWith(_ =>
+                    {
+                        if (!stopTask.IsCompleted)
+                        {
+                            Log.Write("VLC stop still has not returned after 5s; the player is abandoned (its stop thread, input and player leak until the stop ever returns)");
+                        }
+                    }, TaskScheduler.Default);
+                }
+            }
+            bool stopped;
+            try
+            {
+                stopped = stopTask.Wait(StopGrace);
+            }
+            catch (Exception)
+            {
+                stopped = false;
+            }
+            if (stopped)
+            {
+                return true;
+            }
+            lock (_stopLock)
+            {
+                if (_mediaPlayer == player)
+                {
+                    _playerPoisoned = true;
+                }
+            }
+            Log.Write("VLC stop did not return within 500ms; the player will be replaced before the next play");
+            return false;
+        }
+
+        // Stop thread. Runs the one blocking call, then owns the captured
+        // pair until it is safe to release: the input is disposed only after
+        // Stop() returns (the input thread may still be inside it until
+        // then), and the player is disposed only if it has already been
+        // replaced (the live player is never disposed from here) — or if
+        // Dispose() is pending and this is the last stop still running.
+        private void RunStop(MediaPlayer player, HttpMediaInput input, DateTime started)
+        {
+            try
+            {
+                player.Stop();
+                var elapsed = (long)(DateTime.UtcNow - started).TotalMilliseconds;
+                Log.Write("VLC stop done (took " + elapsed + "ms)");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("VLC stop failed", ex);
+            }
+            finally
+            {
+                try
+                {
+                    input?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("Disposing the stopped VLC input failed", ex);
+                }
+                MediaPlayer capturedToDispose = null;
+                MediaPlayer liveToDispose = null;
+                LibVLC libVlc = null;
+                lock (_stopLock)
+                {
+                    _stopsInFlight--;
+                    if (_stopPlayer == player)
+                    {
+                        _stopPlayer = null;
+                        _stopTask = null;
+                    }
+                    if (_mediaPlayer == player)
+                    {
+                        // The stop finished for the live player: it is usable
+                        // again, so clear a poison flag set while it was stuck.
+                        _playerPoisoned = false;
+                    }
+                    else
+                    {
+                        // Replaced while stopping: reclaim it now that it stopped.
+                        capturedToDispose = player;
+                    }
+                    if (_disposePending && _stopsInFlight == 0 && _mediaPlayer != null)
+                    {
+                        // Last stop finished and Dispose() was requested:
+                        // tear the live player and the instance down here,
+                        // on this thread, never on the queue.
+                        liveToDispose = _mediaPlayer;
+                        _mediaPlayer = null;
+                        libVlc = _libVlc;
+                        _libVlc = null;
+                    }
+                }
+                if (capturedToDispose != null)
+                {
+                    try
+                    {
+                        capturedToDispose.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("Disposing the abandoned VLC player failed", ex);
+                    }
+                }
+                if (liveToDispose != null)
+                {
+                    try
+                    {
+                        liveToDispose.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("Disposing the VLC player after a deferred stop failed", ex);
+                    }
+                }
+                if (libVlc != null)
+                {
+                    try
+                    {
+                        libVlc.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("Disposing LibVLC after a deferred stop failed", ex);
+                    }
+                }
+            }
+        }
+
+        // Worker. True while a stop thread still owns a player (its Stop()
+        // has not returned). Callers that would dispose or replace the
+        // player must defer instead.
+        private bool IsStopOutstanding()
+        {
+            lock (_stopLock)
+            {
+                return _stopPlayer != null;
+            }
+        }
+
+        // Worker. True while the live player cannot be played on: a stop is
+        // still running for it, or a stop outran StopGrace and poisoned it.
+        private bool IsPlayerStuck()
+        {
+            lock (_stopLock)
+            {
+                return _playerPoisoned || (_stopPlayer != null && _stopPlayer == _mediaPlayer);
+            }
+        }
+
+        // Worker. Replaces the live MediaPlayer with a fresh one on the same
+        // LibVLC instance. Used when a stop outran StopGrace: the old player
+        // is still owned by its stop thread and must never be played on
+        // again (its late Stop() would kill the new stream). The old player
+        // is disposed by its stop thread once Stop() returns, and its late
+        // events are dropped by the epoch check in QueueFromVlc/PostFromVlc.
+        // The new player is published through MediaPlayerCreated so the
+        // VideoView re-attaches, exactly as a LibVLC re-create does.
+        // Returns false only if no replacement could be made (no instance,
+        // disposed, or the player is not actually stuck); the caller must
+        // then not Play at all.
+        private bool RecreatePlayer()
+        {
+            if (_disposed || _libVlc == null || _mediaPlayer == null)
+            {
+                return false;
+            }
+            lock (_stopLock)
+            {
+                if (!_playerPoisoned && _stopPlayer != _mediaPlayer)
+                {
+                    // Nothing to recover from; never orphan a live player.
+                    return false;
+                }
+            }
+            MediaPlayer player;
+            try
+            {
+                player = new MediaPlayer(_libVlc);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Recreating the VLC player failed", ex);
+                return false;
+            }
+            Subscribe(player);
+            _mediaPlayer = player;
+            Interlocked.Increment(ref _playerEpoch);
+            lock (_stopLock)
+            {
+                _playerPoisoned = false;
+            }
+            var version = _libVlc.Version;
+            Log.Write("Recreated the VLC player after a stop that did not return");
+            RunOnUi(() =>
+            {
+                Version = version;
+                MediaPlayerCreated?.Invoke(player);
+            });
+            return true;
         }
 
         // Plain files go through Windows' HTTP stack. HLS and DASH playlists need VLC to fetch the
@@ -921,8 +1251,9 @@ namespace Nuvio.Playback
                     RaiseState("buffering", null);
                 }
             });
-            StartPlayback(resumeSeconds);
-            return true;
+            // A reconnect that cannot play (no usable player) reports the
+            // failure instead of claiming a reconnect happened.
+            return StartPlayback(resumeSeconds);
         }
 
         // Worker.
@@ -979,10 +1310,11 @@ namespace Nuvio.Playback
             {
                 return;
             }
+            var epoch = Interlocked.Read(ref _playerEpoch);
             Enqueue(() =>
             {
                 Interlocked.Exchange(ref _trackRefreshQueued, 0);
-                if (_mediaPlayer == null || _request == null)
+                if (epoch != Interlocked.Read(ref _playerEpoch) || _mediaPlayer == null || _request == null)
                 {
                     return;
                 }
@@ -1205,9 +1537,10 @@ namespace Nuvio.Playback
         private void QueueFromVlc(Action<long> work)
         {
             var seq = Interlocked.Read(ref _workerLoadSeq);
+            var epoch = Interlocked.Read(ref _playerEpoch);
             Enqueue(() =>
             {
-                if (seq == Interlocked.Read(ref _workerLoadSeq))
+                if (seq == Interlocked.Read(ref _workerLoadSeq) && epoch == Interlocked.Read(ref _playerEpoch))
                 {
                     work(seq);
                 }
@@ -1218,9 +1551,10 @@ namespace Nuvio.Playback
         private void PostFromVlc(Action<long> work)
         {
             var seq = Interlocked.Read(ref _workerLoadSeq);
+            var epoch = Interlocked.Read(ref _playerEpoch);
             RunOnUi(() =>
             {
-                if (seq == _loadSeq)
+                if (seq == _loadSeq && epoch == Interlocked.Read(ref _playerEpoch))
                 {
                     work(seq);
                 }
