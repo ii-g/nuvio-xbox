@@ -108,6 +108,7 @@ namespace Nuvio.Playback
         private OpenRequest _request;
         private HttpMediaInput _input;
         private int _vlcLogLines;
+        private int _vlcLogSuppressed;
         private volatile bool _hasPlayed;
         private bool _inputStarted;
         private int _reconnects;
@@ -294,6 +295,7 @@ namespace Nuvio.Playback
             _libVlc = null;
             _initError = null;
             Interlocked.Exchange(ref _vlcLogLines, 0);
+            Interlocked.Exchange(ref _vlcLogSuppressed, 0);
             // _ready stays set and _initStarted stays 1: creation below runs synchronously on
             // this queue, so any Open queued after this sees the new instance without waiting.
             CreateLibVlc(stored);
@@ -954,6 +956,11 @@ namespace Nuvio.Playback
         {
             try
             {
+                // Diagnostic: marks entry into the blocking Stop() call, so
+                // a later log with this line but no "stop done" line proves
+                // the stop thread is stuck inside Stop() itself (M1), not
+                // before it.
+                Log.Write("VLC stop entering player.Stop()");
                 player.Stop();
                 var elapsed = (long)(DateTime.UtcNow - started).TotalMilliseconds;
                 Log.Write("VLC stop done (took " + elapsed + "ms)");
@@ -1135,8 +1142,22 @@ namespace Nuvio.Playback
         {
             try
             {
-                if (e.Level < LogLevel.Warning || Interlocked.Increment(ref _vlcLogLines) > 400)
+                if (e.Level < LogLevel.Warning)
                 {
+                    return;
+                }
+                if (Interlocked.Increment(ref _vlcLogLines) > 400)
+                {
+                    // Cap reached: keep counting the suppressed lines and
+                    // report every 100, so the next log still shows whether
+                    // the vlc channel went quiet or kept firing after the
+                    // cap (log 31 went dark this way) without letting the
+                    // log grow without bound.
+                    var suppressed = Interlocked.Increment(ref _vlcLogSuppressed);
+                    if (suppressed % 100 == 1)
+                    {
+                        Log.Write("vlc log: cap (400) reached, " + suppressed + " warning/error lines suppressed so far");
+                    }
                     return;
                 }
                 Log.Write("vlc " + e.Level.ToString().ToLowerInvariant() + " [" + e.Module + "] " + e.Message);
@@ -1236,6 +1257,12 @@ namespace Nuvio.Playback
                 }
                 ApplyVideoScale();
             }
+            // Diagnostic only: log the values (and the timing, via the log
+            // timestamp) of the two audio writes, so the next log shows
+            // whether the "cannot get volume service" errors at the Playing
+            // millisecond come from these writes or from VLC itself. The
+            // writes themselves and their timing are unchanged.
+            Log.Write("VLC applying audio settings: volume=" + _wantVolume + " mute=" + _wantMute);
             _mediaPlayer.Volume = _wantVolume;
             _mediaPlayer.Mute = _wantMute;
             if (Math.Abs(_mediaPlayer.Rate - _wantRate) > 0.001f)
