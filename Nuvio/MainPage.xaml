@@ -136,7 +136,7 @@
                             FlowDirection="LeftToRight" AreTransportControlsEnabled="False" Stretch="Uniform" />
 
         <!-- LibVLC fallback surface, used only when WMF cannot play a source. -->
-        <vlc:VideoView x:Name="VideoView" x:Load="False"
+        <vlc:VideoView x:Name="VideoView" x:Load="False" FlowDirection="LeftToRight"
                        SizeChanged="VideoView_SizeChanged" Opacity="0"
                        IsHitTestVisible="False" IsTabStop="False" />
 
