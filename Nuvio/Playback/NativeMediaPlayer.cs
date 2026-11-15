@@ -22,6 +22,7 @@ namespace Nuvio.Playback
         public double StartSeconds;
         public Dictionary<string, string> Headers = new Dictionary<string, string>();
         public bool HardwareDecoding = true;
+        public string EngineMode = "auto";
     }
 
     /// <summary>Native Windows Media Foundation playback for the UWP app.</summary>
