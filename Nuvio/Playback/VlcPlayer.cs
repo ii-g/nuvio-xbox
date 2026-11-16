@@ -49,6 +49,12 @@ namespace Nuvio.Playback
         // imperceptible next to a seconds-long open; the queue is never
         // stalled longer than this by any single stop.
         private static readonly TimeSpan StopGrace = TimeSpan.FromMilliseconds(500);
+        // Opening stops get a longer grace: the input thread may be
+        // mid-HTTP round-trip (a healthy one takes up to ~1s), so 2000ms
+        // recovers stops that would have returned just past 500ms instead
+        // of poisoning the player. Other states keep 500ms: a stop stuck
+        // for minutes is not saved by any grace.
+        private static readonly TimeSpan StopGraceOpening = TimeSpan.FromMilliseconds(2000);
         private static readonly TimeSpan OpenTimeout = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan WatchdogTick = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan VlcStatsInterval = TimeSpan.FromSeconds(2);
@@ -1238,10 +1244,11 @@ namespace Nuvio.Playback
                     }, TaskScheduler.Default);
                 }
             }
+            var grace = stateAtStop == "Opening" ? StopGraceOpening : StopGrace;
             bool stopped;
             try
             {
-                stopped = stopTask.Wait(StopGrace);
+                stopped = stopTask.Wait(grace);
             }
             catch (Exception)
             {
@@ -1262,7 +1269,7 @@ namespace Nuvio.Playback
                 _lastAbandonedStop = stopSeq;
                 _lastAbandonedPlayer = player;
             }
-            Log.Write("VLC stop did not return within 500ms; the player will be replaced before the next play (stop=" + stopSeq + " epoch=" + epochAtStop + " state=" + stateAtStop + " vout=" + voutAtStop + " poisoned=" + poisoned + " join=" + joined + ")");
+            Log.Write("VLC stop did not return within " + (int)grace.TotalMilliseconds + "ms; the player will be replaced before the next play (stop=" + stopSeq + " epoch=" + epochAtStop + " state=" + stateAtStop + " vout=" + voutAtStop + " poisoned=" + poisoned + " join=" + joined + ")");
             RequestDetachAndSurfaceReplacement(player, stopSeq, epochAtStop, voutAtStop, stateAtStop);
             return false;
         }
@@ -1387,13 +1394,17 @@ namespace Nuvio.Playback
             long reads = 0;
             long readAgeMs = -1;
             bool closed = false;
+            string inputOp = "Idle";
+            long inputOpAgeMs = -1;
             if (input != null)
             {
                 reads = input.ReadCount;
                 readAgeMs = input.LastReadAgeMs;
                 closed = input.CloseCount > 0;
+                inputOp = input.LastInputOp;
+                inputOpAgeMs = input.LastInputOpAgeMs;
             }
-            Log.Write("VLC stop still has not returned after 5s; the player is abandoned (its stop thread, input and player leak until the stop ever returns) (stop=" + stopSeq + " epoch=" + epochAtStop + " alive=True stopsInFlight=" + inFlight + " poisoned=" + poisoned + " inputReads=" + reads + " inputReadAgeMs=" + readAgeMs + " inputClosed=" + closed + ")");
+            Log.Write("VLC stop still has not returned after 5s; the player is abandoned (its stop thread, input and player leak until the stop ever returns) (stop=" + stopSeq + " epoch=" + epochAtStop + " alive=True stopsInFlight=" + inFlight + " poisoned=" + poisoned + " inputReads=" + reads + " inputReadAgeMs=" + readAgeMs + " inputClosed=" + closed + " inputOp=" + inputOp + " inputOpAgeMs=" + inputOpAgeMs + ")");
             RunOnUi(() =>
             {
                 Log.Write("VLC stop watch view probe (stop=" + stopSeq + " epoch=" + epochAtStop + " viewBoundToOld=" + ProbeViewBoundTo(abandonedPlayer) + ")");

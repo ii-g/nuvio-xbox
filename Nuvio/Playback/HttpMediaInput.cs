@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using LibVLCSharp.Shared;
 using Nuvio.Diagnostics;
 using Windows.Web.Http;
@@ -24,6 +25,16 @@ namespace Nuvio.Playback
         private static readonly HttpClient Client = CreateClient();
 
         private readonly object _sync = new object();
+        // One cancellation source for the input's lifetime: Abort() cancels
+        // its token so a request in flight is asked to stop at once, and
+        // every network wait also has a hard 15s bound (WaitBounded) so the
+        // input thread is freed even if the WinRT stack ignores the
+        // cancellation. Created in the constructor, never replaced, disposed
+        // once by Close().
+        private CancellationTokenSource _cts;
+        private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(15);
+        private string _lastInputOp = "Idle";
+        private long _lastInputOpTicks;
         private readonly IDictionary<string, string> _headers;
         private readonly byte[] _buffer = new byte[256 * 1024];
         private Uri _uri;
@@ -92,10 +103,41 @@ namespace Nuvio.Playback
             }
         }
 
+        /// <summary>Last operation the input thread entered: "OpenAt", "Read", "Seek" or "Idle".</summary>
+        internal string LastInputOp
+        {
+            get { return _lastInputOp; }
+        }
+
+        /// <summary>Milliseconds since the input thread entered its current operation, or -1 when idle.</summary>
+        internal long LastInputOpAgeMs
+        {
+            get
+            {
+                if (_lastInputOp == "Idle")
+                {
+                    return -1;
+                }
+                var ticks = Interlocked.Read(ref _lastInputOpTicks);
+                if (ticks == 0)
+                {
+                    return -1;
+                }
+                return (long)(DateTime.UtcNow - new DateTime(ticks)).TotalMilliseconds;
+            }
+        }
+
+        private void SetInputOp(string op)
+        {
+            _lastInputOp = op;
+            Interlocked.Exchange(ref _lastInputOpTicks, DateTime.UtcNow.Ticks);
+        }
+
         public HttpMediaInput(string url, IDictionary<string, string> headers)
         {
             _uri = new Uri(url);
             _headers = headers ?? new Dictionary<string, string>();
+            _cts = new CancellationTokenSource();
             CanSeek = true;
         }
 
@@ -105,6 +147,19 @@ namespace Nuvio.Playback
             lock (_sync)
             {
                 _aborted = true;
+                // Cancel first: a request in flight is asked to stop before
+                // the body is torn down. Skipped when Close() already
+                // disposed the source (nothing left to cancel).
+                if (_cts != null)
+                {
+                    try
+                    {
+                        _cts.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
+                }
                 CloseResponse();
             }
         }
@@ -211,13 +266,22 @@ namespace Nuvio.Playback
                 {
                     throw new IOException("No response");
                 }
-                var read = body.Read(_buffer, 0, (int)Math.Min(length, (uint)_buffer.Length));
-                if (read > 0)
+                SetInputOp("Read");
+                try
                 {
-                    Marshal.Copy(_buffer, 0, buf, read);
-                    _position += (ulong)read;
+                    var readTask = body.ReadAsync(_buffer, 0, (int)Math.Min(length, (uint)_buffer.Length), _cts.Token);
+                    var read = WaitBounded(readTask, "Read", _position);
+                    if (read > 0)
+                    {
+                        Marshal.Copy(_buffer, 0, buf, read);
+                        _position += (ulong)read;
+                    }
+                    return read;
                 }
-                return read;
+                finally
+                {
+                    SetInputOp("Idle");
+                }
             }
         }
 
@@ -231,6 +295,7 @@ namespace Nuvio.Playback
             {
                 return false;
             }
+            SetInputOp("Seek");
             try
             {
                 OpenAt(offset);
@@ -265,6 +330,10 @@ namespace Nuvio.Playback
                 }
                 return false;
             }
+            finally
+            {
+                SetInputOp("Idle");
+            }
         }
 
         public override void Close()
@@ -273,6 +342,11 @@ namespace Nuvio.Playback
             lock (_sync)
             {
                 CloseResponse();
+                if (_cts != null)
+                {
+                    _cts.Dispose();
+                    _cts = null;
+                }
             }
         }
 
@@ -288,76 +362,85 @@ namespace Nuvio.Playback
                 }
             }
 
-            var request = new HttpRequestMessage(HttpMethod.Get, _uri);
-            request.Headers.TryAppendWithoutValidation("Range", "bytes=" + offset + "-");
-            var hasUserAgent = false;
-            foreach (var header in _headers)
-            {
-                if (string.IsNullOrWhiteSpace(header.Key) || header.Key.Equals("Range", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-                hasUserAgent |= header.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase);
-                request.Headers.TryAppendWithoutValidation(header.Key, header.Value ?? string.Empty);
-            }
-            if (!hasUserAgent)
-            {
-                request.Headers.TryAppendWithoutValidation("User-Agent", DefaultUserAgent);
-            }
-            var response = Client.SendRequestAsync(request, HttpCompletionOption.ResponseHeadersRead).AsTask().GetAwaiter().GetResult();
-            if (!response.IsSuccessStatusCode)
-            {
-                var status = (int)response.StatusCode + " " + response.ReasonPhrase;
-                response.Dispose();
-                throw new IOException("HTTP " + status);
-            }
-
-            // Keep using the address the redirects led to, so seeks skip the addon's redirect.
-            if (response.RequestMessage != null && response.RequestMessage.RequestUri != null)
-            {
-                _uri = response.RequestMessage.RequestUri;
-            }
-            var range = response.Content.Headers.ContentRange;
-            if (response.StatusCode == HttpStatusCode.PartialContent && range != null && range.Length.HasValue)
-            {
-                _length = range.Length.Value;
-                _supportsRanges = true;
-            }
-            else
-            {
-                if (offset > 0)
-                {
-                    response.Dispose();
-                    throw new IOException("The server doesn't support seeking");
-                }
-                _length = response.Content.Headers.ContentLength ?? 0;
-                _supportsRanges = false;
-            }
-
-            Stream body;
+            SetInputOp("OpenAt");
             try
             {
-                body = response.Content.ReadAsInputStreamAsync().AsTask().GetAwaiter().GetResult().AsStreamForRead(0);
-            }
-            catch
-            {
-                response.Dispose();
-                throw;
-            }
-            lock (_sync)
-            {
-                if (_aborted)
+                var request = new HttpRequestMessage(HttpMethod.Get, _uri);
+                request.Headers.TryAppendWithoutValidation("Range", "bytes=" + offset + "-");
+                var hasUserAgent = false;
+                foreach (var header in _headers)
                 {
-                    body.Dispose();
-                    response.Dispose();
-                    throw new OperationCanceledException();
+                    if (string.IsNullOrWhiteSpace(header.Key) || header.Key.Equals("Range", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    hasUserAgent |= header.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase);
+                    request.Headers.TryAppendWithoutValidation(header.Key, header.Value ?? string.Empty);
                 }
-                CloseResponse();
-                _response = response;
-                _body = body;
-                _position = offset;
-                _dead = false;
-                _retriedRead = false;
+                if (!hasUserAgent)
+                {
+                    request.Headers.TryAppendWithoutValidation("User-Agent", DefaultUserAgent);
+                }
+                var sendTask = Client.SendRequestAsync(request, HttpCompletionOption.ResponseHeadersRead).AsTask(_cts.Token);
+                var response = WaitBounded(sendTask, "OpenAt", offset);
+                if (!response.IsSuccessStatusCode)
+                {
+                    var status = (int)response.StatusCode + " " + response.ReasonPhrase;
+                    response.Dispose();
+                    throw new IOException("HTTP " + status);
+                }
+
+                // Keep using the address the redirects led to, so seeks skip the addon's redirect.
+                if (response.RequestMessage != null && response.RequestMessage.RequestUri != null)
+                {
+                    _uri = response.RequestMessage.RequestUri;
+                }
+                var range = response.Content.Headers.ContentRange;
+                if (response.StatusCode == HttpStatusCode.PartialContent && range != null && range.Length.HasValue)
+                {
+                    _length = range.Length.Value;
+                    _supportsRanges = true;
+                }
+                else
+                {
+                    if (offset > 0)
+                    {
+                        response.Dispose();
+                        throw new IOException("The server doesn't support seeking");
+                    }
+                    _length = response.Content.Headers.ContentLength ?? 0;
+                    _supportsRanges = false;
+                }
+
+                Stream body;
+                try
+                {
+                    body = WaitBounded(response.Content.ReadAsInputStreamAsync().AsTask(_cts.Token), "OpenAt", offset).AsStreamForRead(0);
+                }
+                catch
+                {
+                    response.Dispose();
+                    throw;
+                }
+                lock (_sync)
+                {
+                    if (_aborted)
+                    {
+                        body.Dispose();
+                        response.Dispose();
+                        throw new OperationCanceledException();
+                    }
+                    CloseResponse();
+                    _response = response;
+                    _body = body;
+                    _position = offset;
+                    _dead = false;
+                    _retriedRead = false;
+                }
+            }
+            finally
+            {
+                SetInputOp("Idle");
             }
         }
 
@@ -367,6 +450,40 @@ namespace Nuvio.Playback
             _body = null;
             _response?.Dispose();
             _response = null;
+        }
+
+        /// <summary>Waits for one network step with a hard 15s bound: the
+        /// input thread is freed at the timeout even if the WinRT stack
+        /// ignores the cancellation request. A late result is disposed so no
+        /// socket leaks. A cancelled wait (Abort() fired) is reported as an
+        /// OperationCanceledException, as before.</summary>
+        private T WaitBounded<T>(Task<T> task, string op, ulong position)
+        {
+            var completed = Task.WhenAny(task, Task.Delay(RequestTimeout)).GetAwaiter().GetResult();
+            if (!ReferenceEquals(completed, task))
+            {
+                var ignored = task.ContinueWith(t =>
+                {
+                    if (t.Status == TaskStatus.RanToCompletion)
+                    {
+                        var disposable = t.Result as IDisposable;
+                        if (disposable != null)
+                        {
+                            disposable.Dispose();
+                        }
+                    }
+                }, TaskScheduler.Default);
+                throw new IOException("HTTP request timed out (op=" + op + " at " + position + ")");
+            }
+            if (task.IsCanceled)
+            {
+                if (_aborted)
+                {
+                    Log.Write("HTTP request cancelled (op=" + op + ")");
+                }
+                throw new OperationCanceledException();
+            }
+            return task.GetAwaiter().GetResult();
         }
 
         private void EnterDead(Exception ex)

@@ -109,6 +109,10 @@ namespace Nuvio.ViewModels
         private const int FallbackDelayMs = 1500;
         private const int StallCheckMs = 5000;
         private const int StallTimeoutMs = 15000;
+        // F2: a later stall is a new incident, not the second consecutive
+        // one, after this much continuous healthy playback — then the
+        // counter resets (see OnStallTimerTick).
+        private const int StallStableResetMs = 60000;
         private const int SeekStepSeconds = 10;
         private const int ScrubCommitMs = 700;
 
@@ -196,6 +200,11 @@ namespace Nuvio.ViewModels
         private double _stallCheckPosition = double.NaN;
         private DateTime _stallCheckAt = DateTime.UtcNow;
         private double _stallSlowMs;
+        // F2: wall time of continuous healthy playback since the last slow
+        // sample, and whether the current open is a stall reconnect (set by
+        // OnStallTimerTick just before it calls Start; Start consumes it).
+        private double _stallHealthyMs;
+        private bool _stallReconnectPending;
         private bool _fallbackNoticeShown;
         private bool _sessionStarted;
         private StreamItem _fallbackTarget;
@@ -684,6 +693,16 @@ namespace Nuvio.ViewModels
             // belongs to the previous source).
             _stallCheckPosition = double.NaN;
             _stallSlowMs = 0;
+            // Stall counter: a reconnect after a stall keeps the counter (so
+            // a second stall escalates to the next source); any other open
+            // resets it — a user re-open is a fresh viewing, not a
+            // consecutive stall.
+            if (_stallReconnectPending) _stallReconnectPending = false;
+            else
+            {
+                _stallReconnects = 0;
+                _stallHealthyMs = 0;
+            }
             _player.Open(target, at);
             _openTimer.Interval = TimeSpan.FromSeconds(OpenTimeoutSeconds);
             _openTimer.Start();
@@ -793,7 +812,12 @@ namespace Nuvio.ViewModels
                 StopTimer(_openTimer);
                 Ready = true;
                 _consecutiveFailures = 0;
-                _stallReconnects = 0;
+                // Stall counter is NOT reset here: OnPlayerReady fires for a
+                // stall reconnect too, and resetting it made every stall
+                // look like the first one forever (log 37: two reconnects
+                // to the same URL, TryNextSource never reached). Start()
+                // owns the reset instead — reconnects keep the counter,
+                // other opens reset it.
                 // F2: readiness restarts the stall baseline as well (a
                 // re-open after a stall must not inherit the old sample).
                 _stallCheckPosition = double.NaN;
@@ -937,9 +961,20 @@ namespace Nuvio.ViewModels
             if (progressSeconds / (wallMs / 1000.0) >= 0.5 * expected)
             {
                 _stallSlowMs = 0;
+                // Stable playback: after 60s at full rate, a later stall is
+                // a new incident — reset the counter so it does not escalate
+                // on a stall an hour later for an unrelated cause.
+                _stallHealthyMs += wallMs;
+                if (_stallHealthyMs >= StallStableResetMs)
+                {
+                    _stallReconnects = 0;
+                    _stallHealthyMs = 0;
+                    Log.Write("Stall counter reset after 60s stable playback");
+                }
                 return;
             }
             _stallSlowMs += wallMs;
+            _stallHealthyMs = 0;
             if (_stallSlowMs < StallTimeoutMs) return;
             _stallSlowMs = 0;
             if (_stallReconnects < 1)
@@ -947,6 +982,7 @@ namespace Nuvio.ViewModels
                 _stallReconnects++;
                 LoadingText = S("PlayerReconnecting", "Reconnecting…");
                 RequestToast(S("PlayerStalledReconnecting", "Stream stalled. Reconnecting…"));
+                _stallReconnectPending = true;
                 Start(Stream, CurrentTime());
             }
             else
