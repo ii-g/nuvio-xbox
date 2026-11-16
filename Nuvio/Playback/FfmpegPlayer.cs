@@ -62,6 +62,7 @@ namespace Nuvio.Playback
         private bool _videoSizeWasZero;
         private int _pausedKickDone;
         private double _pausedKickPositionSeconds;
+        private int _pausedKickElapsedSeconds;
         private long _mediaPlayerCreated;
         private long _heartbeatCount;
         private double _rateBaselinePositionSeconds;
@@ -69,6 +70,13 @@ namespace Nuvio.Playback
         private bool _rateBaselineValid;
         private int _slowHeartbeatStreak;
         private bool _slowRateLogged;
+        private int _slowKickDone;
+        private bool _slowKickOutcomePending;
+        private Windows.UI.Xaml.DispatcherTimer _heartbeatTimer;
+        private long _positionChangedSinceTimerHeartbeat;
+        private double _timerRateBaselinePositionSeconds;
+        private long _timerRateBaselineTicks;
+        private bool _timerRateBaselineValid;
         private double _surfaceOpacity;
 
         public event Action<string, JsonObject> EventRaised;
@@ -81,6 +89,7 @@ namespace Nuvio.Playback
             if (view == null) throw new ArgumentNullException(nameof(view));
             _view = view;
             CreateMediaPlayer();
+            StartHeartbeatTimer();
         }
 
         private void CreateMediaPlayer()
@@ -130,16 +139,67 @@ namespace Nuvio.Playback
             }
         }
 
+        // F3: timer-driven heartbeat. The event-driven heartbeat in
+        // OnPositionChanged goes silent if PositionChanged stops firing
+        // at all, which is exactly the freeze the log then cannot
+        // explain. DispatcherTimer ticks on the UI thread at a fixed
+        // interval (Microsoft Learn, Windows.UI.Xaml.DispatcherTimer:
+        // Tick fires after Interval elapses and keeps firing until
+        // Stop; available since 10.0.10240.0), so the tick reads
+        // session.Position directly instead of waiting for an event.
+        // Started once with the player, stopped only on Dispose; the
+        // tick itself is a no-op outside confirmed playback, so the
+        // open watchdog stays the only voice before confirmation.
+        // Note: the timer also stops while the app is suspended — a
+        // suspended app is not playing, so no heartbeat is lost there.
+        private void StartHeartbeatTimer()
+        {
+            if (_heartbeatTimer != null) return;
+            try
+            {
+                var timer = new Windows.UI.Xaml.DispatcherTimer();
+                timer.Interval = TimeSpan.FromSeconds(10);
+                timer.Tick += OnHeartbeatTimerTick;
+                _heartbeatTimer = timer;
+                timer.Start();
+            }
+            catch (Exception ex)
+            {
+                Log.Write("FFmpeg timer heartbeat could not start: " + ex.GetType().Name);
+            }
+        }
+
+        private void StopHeartbeatTimer()
+        {
+            var timer = _heartbeatTimer;
+            _heartbeatTimer = null;
+            if (timer == null) return;
+            try
+            {
+                timer.Stop();
+                timer.Tick -= OnHeartbeatTimerTick;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("FFmpeg timer heartbeat could not stop: " + ex.GetType().Name);
+            }
+        }
+
         private void SetViewOpacity(double opacity)
         {
             var view = _view;
             if (view == null) return;
+            // F15: track the intended opacity synchronously. The old
+            // code set _surfaceOpacity only inside the dispatcher
+            // callback, so MemorySnapshot read from heartbeat/open
+            // threads saw the previous value (surface=0 in the same
+            // second the video became ready).
+            _surfaceOpacity = opacity;
             try
             {
                 if (view.Dispatcher.HasThreadAccess)
                 {
                     view.Opacity = opacity;
-                    _surfaceOpacity = opacity;
                     return;
                 }
 
@@ -147,7 +207,6 @@ namespace Nuvio.Playback
                 {
                     if (_disposed || !ReferenceEquals(_view, view)) return;
                     view.Opacity = opacity;
-                    _surfaceOpacity = opacity;
                 });
             }
             catch (Exception ex)
@@ -182,6 +241,9 @@ namespace Nuvio.Playback
             _confirmedGeneration = 0;
             _pausedKickDone = 0;
             _pausedKickPositionSeconds = 0;
+            _pausedKickElapsedSeconds = 0;
+            _slowKickDone = 0;
+            _slowKickOutcomePending = false;
             InvalidateRateBaseline();
             if (_view == null)
             {
@@ -391,29 +453,40 @@ namespace Nuvio.Playback
                                 ConfirmOpenByPlayback(generation, session);
                                 return;
                             }
-                            // A4: frozen at the start — Paused with a full download
-                            // and no movement at 10s gets one Play() retry; still
-                            // Paused at 20s fails the open early instead of waiting
-                            // for the 30s timeout. _playWhenOpened is never raised
+                            // A4/F4: frozen at the start — Paused with
+                            // barely any movement gets one Play() retry;
+                            // still Paused with barely any movement 10s
+                            // after the kick fails the open early instead
+                            // of waiting for the 30s timeout. The kick
+                            // fires on the first tick at or after 10s
+                            // that qualifies (not only the 10s tick), and
+                            // "barely any" is under 0.5s of advance in
+                            // the 5s tick window (not zero movement
+                            // only). F5: DownloadProgress is no longer a
+                            // condition — for a MediaStreamSource it
+                            // reads 100% even while frozen, so it proved
+                            // nothing; it stays in the log line as
+                            // context only. _playWhenOpened is never raised
                             // here (OnMediaOpened consumed it); the kick goes
                             // straight to the player, as SetPaused does.
-                            if (tickElapsed == 10 && session.PlaybackState == MediaPlaybackState.Paused &&
-                                positionSeconds <= previousPositionSeconds && session.DownloadProgress >= 1.0 &&
+                            if (tickElapsed >= 10 && session.PlaybackState == MediaPlaybackState.Paused &&
+                                positionSeconds - previousPositionSeconds < 0.5 &&
                                 Interlocked.Exchange(ref _pausedKickDone, 1) == 0)
                             {
                                 _pausedKickPositionSeconds = positionSeconds;
+                                _pausedKickElapsedSeconds = tickElapsed;
                                 try
                                 {
                                     var player = _mediaPlayer;
                                     if (player != null) player.Play();
                                 }
                                 catch (Exception ex) { Log.Error("Retrying paused FFmpeg playback failed", ex); }
-                                Log.Write("FFmpeg frozen at start (state=Paused pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s download=" + Math.Round(session.DownloadProgress * 100) + "% at 10s); retrying Play() once");
+                                Log.Write("FFmpeg frozen at start (state=Paused pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s download=" + Math.Round(session.DownloadProgress * 100) + "% at " + tickElapsed + "s); retrying Play() once");
                             }
-                            if (tickElapsed == 20 && _pausedKickDone == 1 && session.PlaybackState == MediaPlaybackState.Paused &&
-                                positionSeconds <= _pausedKickPositionSeconds && session.DownloadProgress >= 1.0)
+                            if (_pausedKickDone == 1 && tickElapsed - _pausedKickElapsedSeconds >= 10 && session.PlaybackState == MediaPlaybackState.Paused &&
+                                positionSeconds - _pausedKickPositionSeconds < 0.5)
                             {
-                                Log.Write("FFmpeg still paused at start after Play() retry (pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s download=" + Math.Round(session.DownloadProgress * 100) + "% at 20s); failing open early");
+                                Log.Write("FFmpeg still paused at start after Play() retry (pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s download=" + Math.Round(session.DownloadProgress * 100) + "% at " + tickElapsed + "s); failing open early");
                                 FailOpen(generation, "The stream stayed paused at the start after a playback retry.", "OpenTimeout");
                                 return;
                             }
@@ -787,6 +860,7 @@ namespace Nuvio.Playback
             _disposed = true;
             Interlocked.Increment(ref _openGeneration);
             CancelPendingOpen();
+            StopHeartbeatTimer();
             ReleaseMediaPlayer();
             _view = null;
         }
@@ -808,6 +882,10 @@ namespace Nuvio.Playback
                     sender.PlaybackSession.Position = TimeSpan.FromSeconds(_pendingStartSeconds);
                 sender.Play();
                 Log.Write("FFmpeg media source opened; starting playback");
+                // F8: Play() returning does not mean playback started —
+                // verify it a few seconds later (see
+                // VerifyPlayStartedAsync).
+                _ = VerifyPlayStartedAsync(Interlocked.Read(ref _openGeneration));
                 RefreshTracks();
             }
             catch (Exception ex)
@@ -815,6 +893,64 @@ namespace Nuvio.Playback
                 Log.Write("Starting opened FFmpeg media failed: " + DescribeOpenException(ex) +
                     " hwdec=" + _hardwareDecodingRequested + " at " + Math.Round(_lastPositionSeconds) + "s");
                 FailOpen(Interlocked.Read(ref _openGeneration), "FFmpeg could not start playback.", "StartFailed");
+            }
+        }
+
+        // F8: Play() returning does not mean playback started (log 27
+        // session A sat Paused at 0s with no error line). Five seconds
+        // after OnMediaOpened, a still-Paused session that never
+        // confirmed gets one Play() retry with an explicit log line,
+        // and a second check 5s later only logs the outcome — the
+        // open watchdog owns any failure. The retry shares the
+        // watchdog's _pausedKickDone flag (with its position/elapsed
+        // tracking), so a frozen start gets exactly one Play() retry
+        // in total, whoever fires first, and the watchdog's early
+        // failure still lands 10s after that retry. A user pause
+        // after confirmation (_readySent) is never overridden.
+        private async Task VerifyPlayStartedAsync(long generation)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                var view = _view;
+                if (view == null) return;
+                var retried = false;
+                await view.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || _openFailed || _readySent || generation != Interlocked.Read(ref _openGeneration)) return;
+                    var player = _mediaPlayer;
+                    if (player == null) return;
+                    MediaPlaybackSession session;
+                    try { session = player.PlaybackSession; }
+                    catch (Exception) { return; }
+                    if (session == null || session.PlaybackState != MediaPlaybackState.Paused) return;
+                    if (Interlocked.Exchange(ref _pausedKickDone, 1) != 0) return;
+                    _pausedKickPositionSeconds = session.Position.TotalSeconds;
+                    _pausedKickElapsedSeconds = 5;
+                    Log.Write("FFmpeg play did not start (state=Paused 5s after open, pos=" + Math.Round(session.Position.TotalSeconds) + "s); retrying Play() once");
+                    try { player.Play(); }
+                    catch (Exception ex) { Log.Error("FFmpeg play-start retry failed", ex); return; }
+                    retried = true;
+                });
+                if (!retried) return;
+                await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                var retryView = _view;
+                if (retryView == null) return;
+                await retryView.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || _openFailed || generation != Interlocked.Read(ref _openGeneration)) return;
+                    var player = _mediaPlayer;
+                    if (player == null) return;
+                    MediaPlaybackSession session;
+                    try { session = player.PlaybackSession; }
+                    catch (Exception) { return; }
+                    if (session == null) return;
+                    Log.Write("FFmpeg play-start retry result: state=" + session.PlaybackState + " pos=" + Math.Round(session.Position.TotalSeconds) + "s");
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("FFmpeg play-start check failed", ex);
             }
         }
 
@@ -947,6 +1083,11 @@ namespace Nuvio.Playback
         // VLC — any FailOpen after confirmation raises player.ended with
         // reason=error, which the hybrid treats as a fallback trigger.
         // Generation-guarded on the UI thread before any action.
+        // F7: Paused at 30s no longer skips the fallback outright (the
+        // old code left an audio-only open stuck forever in exactly the
+        // state that precedes a black screen). It retries Play() once
+        // and re-checks after 10s; still no picture means the same
+        // fallback as the Playing case, whatever the state is then.
         private async Task FailIfVideoStillMissingAsync(long generation)
         {
             try
@@ -954,6 +1095,7 @@ namespace Nuvio.Playback
                 await Task.Delay(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
                 var view = _view;
                 if (view == null) return;
+                var retryPaused = false;
                 await view.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
                 {
                     if (_disposed || generation != Interlocked.Read(ref _openGeneration) || _openFailed || !_readySent) return;
@@ -966,9 +1108,33 @@ namespace Nuvio.Playback
                     }
                     if (session.PlaybackState == MediaPlaybackState.Paused)
                     {
-                        Log.Write("FFmpeg video-size fallback skipped: state=Paused at 30s after confirm");
+                        Log.Write("FFmpeg video-size fallback: state=Paused at 30s after confirm; retrying Play() once and re-checking in 10s");
+                        try
+                        {
+                            var player = _mediaPlayer;
+                            if (player != null) player.Play();
+                        }
+                        catch (Exception ex) { Log.Error("FFmpeg video-size fallback Play() retry failed", ex); }
+                        retryPaused = true;
                         return;
                     }
+                    FailOpen(generation, "The stream plays audio but no video picture appeared within 30 seconds.", "VideoSizeZero");
+                });
+                if (!retryPaused) return;
+                await Task.Delay(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+                var retryView = _view;
+                if (retryView == null) return;
+                await retryView.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || generation != Interlocked.Read(ref _openGeneration) || _openFailed || !_readySent) return;
+                    var session = _mediaPlayer == null ? null : _mediaPlayer.PlaybackSession;
+                    if (session == null) return;
+                    if (session.NaturalVideoWidth != 0 && session.NaturalVideoHeight != 0)
+                    {
+                        Log.Write("FFmpeg video size appeared after Paused Play() retry (" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + "); no fallback");
+                        return;
+                    }
+                    Log.Write("FFmpeg video size still 0x0 after Paused Play() retry; falling back to VLC");
                     FailOpen(generation, "The stream plays audio but no video picture appeared within 30 seconds.", "VideoSizeZero");
                 });
             }
@@ -976,6 +1142,44 @@ namespace Nuvio.Playback
             {
                 Log.Error("FFmpeg video-size fallback check failed", ex);
             }
+        }
+
+        // A2/F7: one same-position seek if the open was confirmed by
+        // playback with no video size and the picture still has not
+        // appeared 15s later while the position keeps advancing — a
+        // nudge that can unstick a decoder/render path that never
+        // produced a first frame. Once only (atomic Exchange, last
+        // in the condition chain), generation-guarded, and never
+        // through the public Seek() (its log line would read as a
+        // user seek). Timer-driven (called from OnHeartbeatTimerTick):
+        // the old trigger lived in OnPositionChanged, so it could
+        // never fire once position events stopped — the exact freeze
+        // it was meant to unstick.
+        private void TryBlackScreenRecovery(MediaPlaybackSession session, long nowTicks)
+        {
+            if (_disposed || _openFailed || !_readySent || _playbackConfirmedTicks == 0 ||
+                session.PlaybackState != MediaPlaybackState.Playing ||
+                session.NaturalVideoWidth != 0 || session.NaturalVideoHeight != 0 ||
+                nowTicks - _playbackConfirmedTicks < TimeSpan.TicksPerSecond * 15 ||
+                session.Position.TotalSeconds <= _confirmedPositionSeconds ||
+                _confirmedGeneration != Interlocked.Read(ref _openGeneration) ||
+                Interlocked.Exchange(ref _videoSizeSeekDone, 1) != 0)
+                return;
+            var confirmedAgoSeconds = (nowTicks - _playbackConfirmedTicks) / TimeSpan.TicksPerSecond;
+            Log.Write("FFmpeg black-screen recovery: same-position seek at pos=" + session.Position.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s size=0x0 (confirmed " + confirmedAgoSeconds + "s ago, confirmedPos=" + _confirmedPositionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s)");
+            try
+            {
+                var player = _mediaPlayer;
+                if (player != null && ReferenceEquals(session, player.PlaybackSession))
+                {
+                    session.Position = session.Position;
+                    if (session.NaturalVideoWidth != 0 && session.NaturalVideoHeight != 0)
+                        Log.Write("FFmpeg black-screen recovery: size after seek=" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + " (was 0x0, pos=" + Math.Round(session.Position.TotalSeconds) + "s)");
+                    else
+                        Log.Write("FFmpeg black-screen recovery: size still 0x0 after seek (pos=" + Math.Round(session.Position.TotalSeconds) + "s)");
+                }
+            }
+            catch (Exception ex) { Log.Error("FFmpeg black-screen recovery seek failed", ex); }
         }
 
         // A1: periodic video-size re-check after the open was confirmed,
@@ -1033,39 +1237,6 @@ namespace Nuvio.Playback
             // Keep the freshest position for failure logs even when the
             // progress event below is coalesced.
             _lastPositionSeconds = Math.Max(0, sender.Position.TotalSeconds);
-            // A2: one same-position seek if the open was confirmed by
-            // playback with no video size and the picture still has not
-            // appeared 15s later while the position keeps advancing — a
-            // nudge that can unstick a decoder/render path that never
-            // produced a first frame. Once only (atomic Exchange, last
-            // in the condition chain), generation-guarded, and never
-            // through the public Seek() (its log line would read as a
-            // user seek). Runs on every position event, unthrottled.
-            var seekNowTicks = DateTime.UtcNow.Ticks;
-            if (!_disposed && !_openFailed && _readySent && _playbackConfirmedTicks != 0 &&
-                sender.PlaybackState == MediaPlaybackState.Playing &&
-                sender.NaturalVideoWidth == 0 && sender.NaturalVideoHeight == 0 &&
-                seekNowTicks - _playbackConfirmedTicks >= TimeSpan.TicksPerSecond * 15 &&
-                sender.Position.TotalSeconds > _confirmedPositionSeconds &&
-                _confirmedGeneration == Interlocked.Read(ref _openGeneration) &&
-                Interlocked.Exchange(ref _videoSizeSeekDone, 1) == 0)
-            {
-                var confirmedAgoSeconds = (seekNowTicks - _playbackConfirmedTicks) / TimeSpan.TicksPerSecond;
-                Log.Write("FFmpeg black-screen recovery: same-position seek at pos=" + sender.Position.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s size=0x0 (confirmed " + confirmedAgoSeconds + "s ago, confirmedPos=" + _confirmedPositionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s)");
-                try
-                {
-                    var player = _mediaPlayer;
-                    if (player != null && ReferenceEquals(sender, player.PlaybackSession))
-                    {
-                        sender.Position = sender.Position;
-                        if (sender.NaturalVideoWidth != 0 && sender.NaturalVideoHeight != 0)
-                            Log.Write("FFmpeg black-screen recovery: size after seek=" + sender.NaturalVideoWidth + "x" + sender.NaturalVideoHeight + " (was 0x0, pos=" + Math.Round(sender.Position.TotalSeconds) + "s)");
-                        else
-                            Log.Write("FFmpeg black-screen recovery: size still 0x0 after seek (pos=" + Math.Round(sender.Position.TotalSeconds) + "s)");
-                    }
-                }
-                catch (Exception ex) { Log.Error("FFmpeg black-screen recovery seek failed", ex); }
-            }
             // Playback heartbeat: the only periodic proof the picture is
             // still advancing. FFmpegInteropX exposes no dropped-frame
             // counter (its public API is stream info only), and neither
@@ -1074,6 +1245,7 @@ namespace Nuvio.Playback
             // signal — plus buffering/download progress for the cause.
             var now = DateTime.UtcNow;
             Interlocked.Increment(ref _positionChangedSinceHeartbeat);
+            Interlocked.Increment(ref _positionChangedSinceTimerHeartbeat);
             var previousEventTicks = Interlocked.Exchange(ref _lastPositionChangedTicks, now.Ticks);
             var previousHeartbeat = Interlocked.Read(ref _lastHeartbeatTicks);
             if (_readySent && sender.PlaybackState == MediaPlaybackState.Playing &&
@@ -1106,6 +1278,97 @@ namespace Nuvio.Playback
             payload.SetNamedValue("duration", JsonValue.CreateNumberValue(sender.NaturalDuration.TotalSeconds));
             Raise("player.duration", payload);
         }
+        // F3: the timer tick itself. Runs on the UI thread every 10s
+        // regardless of PositionChanged, so a frozen event stream still
+        // leaves regular lines: events=0 with a growing lastGap proves
+        // the events stopped, while a timerRate near 0x with events>0
+        // proves the position itself stopped advancing. The tick is a
+        // no-op outside confirmed Playing playback (the open watchdog
+        // owns that phase), and it invalidates its own baseline on
+        // leaving Playing so a pause never reads as slow playback.
+        // The heartbeat line itself is diagnostic; the tick also feeds
+        // the shared slow-rate verdict (F1) and the black-screen
+        // recovery (F7), which are the behaviour changes.
+        private void OnHeartbeatTimerTick(object sender, object e)
+        {
+            if (_disposed || _openFailed) return;
+            var player = _mediaPlayer;
+            if (player == null) return;
+            MediaPlaybackSession session;
+            try { session = player.PlaybackSession; }
+            catch (Exception) { return; }
+            if (session == null) return;
+            if (!_readySent || session.PlaybackState != MediaPlaybackState.Playing)
+            {
+                _timerRateBaselineValid = false;
+                return;
+            }
+            var now = DateTime.UtcNow;
+            var eventCount = Interlocked.Exchange(ref _positionChangedSinceTimerHeartbeat, 0);
+            var lastEventTicks = Interlocked.Read(ref _lastPositionChangedTicks);
+            var lastGapMs = lastEventTicks == 0 ? -1 : (now.Ticks - lastEventTicks) / TimeSpan.TicksPerMillisecond;
+            double? timerRate = null;
+            var positionSeconds = session.Position.TotalSeconds;
+            if (!_timerRateBaselineValid)
+            {
+                _timerRateBaselinePositionSeconds = positionSeconds;
+                _timerRateBaselineTicks = now.Ticks;
+                _timerRateBaselineValid = true;
+            }
+            else
+            {
+                var wallSeconds = (now.Ticks - _timerRateBaselineTicks) / (double)TimeSpan.TicksPerSecond;
+                var deltaSeconds = positionSeconds - _timerRateBaselinePositionSeconds;
+                _timerRateBaselinePositionSeconds = positionSeconds;
+                _timerRateBaselineTicks = now.Ticks;
+                // A backward jump is not slow playback, and a gap over
+                // 30s (3x the tick period) mixes a stall with playing
+                // time: drop the baseline and measure from the next tick.
+                if (deltaSeconds >= 0 && wallSeconds > 0 && wallSeconds <= 30)
+                    timerRate = deltaSeconds / wallSeconds;
+                else
+                    _timerRateBaselineValid = false;
+            }
+            LogTimerHeartbeat(session, eventCount, lastGapMs, timerRate);
+            // F1: the timer's own rate sample feeds the same shared
+            // verdict as the event heartbeat, so slow playback is
+            // caught (and kicked) even when position events stop.
+            if (timerRate.HasValue) ObserveRate(timerRate.Value, "timer", positionSeconds);
+            else
+            {
+                _slowHeartbeatStreak = 0;
+                _slowRateLogged = false;
+            }
+            // F7: the 0x0 size watch and the recovery seek ride the
+            // timer too, so they keep working when position events
+            // stop (the event heartbeat is their old, event-only host).
+            CheckVideoSizeAfterReady(session);
+            TryBlackScreenRecovery(session, now.Ticks);
+        }
+
+        private void LogTimerHeartbeat(MediaPlaybackSession session, long eventCount, long lastGapMs, double? timerRate)
+        {
+            try
+            {
+                // Same shape as the event heartbeat so one grep covers
+                // both, with timerRate measured from the session itself
+                // (not from events) and events counting PositionChanged
+                // since the previous timer tick.
+                Log.Write("FFmpeg timer heartbeat: state=" + session.PlaybackState +
+                    " pos=" + session.Position.TotalSeconds.ToString("F3", CultureInfo.InvariantCulture) + "s/" + Math.Round(session.NaturalDuration.TotalSeconds) + "s" +
+                    " rate=" + session.PlaybackRate +
+                    " timerRate=" + (timerRate.HasValue ? timerRate.Value.ToString("F3", CultureInfo.InvariantCulture) + "x" : "n/a") +
+                    " buffering=" + Math.Round(session.BufferingProgress * 100) + "%" +
+                    " download=" + Math.Round(session.DownloadProgress * 100) + "%" +
+                    " events=" + eventCount +
+                    " lastGap=" + (lastGapMs < 0 ? "n/a" : lastGapMs + "ms"));
+            }
+            catch (Exception ex)
+            {
+                Log.Write("FFmpeg timer heartbeat: could not read session: " + ex.GetType().Name);
+            }
+        }
+
         private void LogHeartbeat(MediaPlaybackSession session, long eventCount, long lastGapMs)
         {
             try
@@ -1135,15 +1398,13 @@ namespace Nuvio.Playback
             }
         }
 
-        // Diagnostic only — no behaviour change: never fails, stops or
-        // alters playback, the watchdog or the open path. Measures the
-        // real advance rate from the position itself, never from
-        // PlaybackRate (which stays 1 even while the clock runs slow):
-        // (position now - position at the previous heartbeat) / wall
-        // seconds between the two heartbeats. Two consecutive heartbeats
-        // below 0.5x log one unmistakable line per slow episode; a
-        // heartbeat back at or above 0.5x closes the episode, so a
-        // later slow period logs again.
+        // Measures the real advance rate from the position itself,
+        // never from PlaybackRate (which stays 1 even while the clock
+        // runs slow): (position now - position at the previous
+        // heartbeat) / wall seconds between the two heartbeats. Each
+        // valid sample — event-driven here, timer-driven in
+        // OnHeartbeatTimerTick — goes to ObserveRate, so the two
+        // sources confirm each other with one shared streak.
         private void CheckSlowPlaybackRate(MediaPlaybackSession session)
         {
             var nowTicks = DateTime.UtcNow.Ticks;
@@ -1175,19 +1436,123 @@ namespace Nuvio.Playback
                 _slowRateLogged = false;
                 return;
             }
-            if (deltaSeconds / wallSeconds < 0.5)
+            ObserveRate(deltaSeconds / wallSeconds, "events", positionSeconds);
+        }
+
+        // F1: shared slow-rate verdict for the event and timer
+        // samples. Two consecutive samples below 0.5x log one
+        // unmistakable line per slow episode and fire the single
+        // resume kick; a sample back at or above 0.5x closes the
+        // episode, so a later slow period logs again. The first valid
+        // sample after a kick logs the kick's outcome, so every SLOW
+        // line is followed in the log by an action and its result.
+        private void ObserveRate(double rate, string source, double positionSeconds)
+        {
+            if (_slowKickOutcomePending)
+            {
+                _slowKickOutcomePending = false;
+                Log.Write("FFmpeg slow-rate kick result: rate=" + rate.ToString("F3", CultureInfo.InvariantCulture) + "x src=" + source + " (" + (rate >= 0.5 ? "recovered" : "still slow") + ")");
+            }
+            if (rate < 0.5)
             {
                 _slowHeartbeatStreak++;
                 if (_slowHeartbeatStreak >= 2 && !_slowRateLogged)
                 {
                     _slowRateLogged = true;
-                    Log.Write("FFmpeg SLOW PLAYBACK RATE: rate=" + (deltaSeconds / wallSeconds).ToString("F3", CultureInfo.InvariantCulture) + "x pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s pageId=" + (_pageId ?? "n/a"));
+                    Log.Write("FFmpeg SLOW PLAYBACK RATE: rate=" + rate.ToString("F3", CultureInfo.InvariantCulture) + "x pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s src=" + source + " pageId=" + (_pageId ?? "n/a"));
+                    TrySlowRateKick(rate);
                 }
             }
             else
             {
                 _slowHeartbeatStreak = 0;
                 _slowRateLogged = false;
+            }
+        }
+
+        // F1: one pause/resume kick per open on confirmed slow
+        // playback. Deliberately NOT an engine switch and NOT a
+        // re-open: no source is reloaded and VLC is never engaged —
+        // the same stream is paused once and resumed 0.5s later, and
+        // the next measured rate logs whether it recovered. The kick
+        // runs on the UI thread (MediaPlayer control calls belong
+        // there); the 0.5s gap lets the pause take effect before the
+        // resume instead of coalescing into a no-op. The outcome flag
+        // is set only after the pause actually happened, so no rate
+        // sample can be logged as the kick's result before the kick.
+        private void TrySlowRateKick(double rate)
+        {
+            if (Interlocked.Exchange(ref _slowKickDone, 1) != 0) return;
+            Log.Write("FFmpeg slow-rate kick: rate=" + rate.ToString("F3", CultureInfo.InvariantCulture) + "x confirmed slow; pausing once and resuming in 0.5s (single kick per open, no engine switch)");
+            var view = _view;
+            var generation = Interlocked.Read(ref _openGeneration);
+            if (view == null) return;
+            try
+            {
+                var ignored = view.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || _openFailed || generation != Interlocked.Read(ref _openGeneration)) return;
+                    var player = _mediaPlayer;
+                    if (player == null) return;
+                    MediaPlaybackSession session;
+                    try { session = player.PlaybackSession; }
+                    catch (Exception) { return; }
+                    if (session == null || session.PlaybackState != MediaPlaybackState.Playing)
+                    {
+                        Log.Write("FFmpeg slow-rate kick skipped: state=" + (session == null ? "n/a" : session.PlaybackState.ToString()) + " (no longer playing)");
+                        return;
+                    }
+                    try { player.Pause(); }
+                    catch (Exception ex)
+                    {
+                        Log.Error("FFmpeg slow-rate kick pause failed", ex);
+                        return;
+                    }
+                    _slowKickOutcomePending = true;
+                    Log.Write("FFmpeg slow-rate kick: paused at pos=" + Math.Round(session.Position.TotalSeconds) + "s; resuming in 0.5s");
+                    _ = ResumeAfterSlowKickAsync(generation);
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("FFmpeg slow-rate kick failed", ex);
+            }
+        }
+
+        private async Task ResumeAfterSlowKickAsync(long generation)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
+                var view = _view;
+                if (view == null) return;
+                await view.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || _openFailed || generation != Interlocked.Read(ref _openGeneration)) return;
+                    var player = _mediaPlayer;
+                    if (player == null) return;
+                    MediaPlaybackSession session;
+                    try { session = player.PlaybackSession; }
+                    catch (Exception) { return; }
+                    if (session == null || session.PlaybackState != MediaPlaybackState.Paused)
+                    {
+                        Log.Write("FFmpeg slow-rate kick resume skipped: state=" + (session == null ? "n/a" : session.PlaybackState.ToString()));
+                        return;
+                    }
+                    try
+                    {
+                        player.Play();
+                        Log.Write("FFmpeg slow-rate kick: resumed at pos=" + Math.Round(session.Position.TotalSeconds) + "s");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("FFmpeg slow-rate kick resume failed", ex);
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("FFmpeg slow-rate kick resume failed", ex);
             }
         }
 
@@ -1202,6 +1567,7 @@ namespace Nuvio.Playback
         private void InvalidateRateBaseline()
         {
             _rateBaselineValid = false;
+            _timerRateBaselineValid = false;
             _slowHeartbeatStreak = 0;
             _slowRateLogged = false;
         }

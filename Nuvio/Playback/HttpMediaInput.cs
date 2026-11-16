@@ -35,6 +35,32 @@ namespace Nuvio.Playback
         private bool _aborted;
         private bool _retriedRead;
 
+        // Read-flood guard: once the input is dead (broken or missing body
+        // after a failed resume), Read returns -1 silently and only retries
+        // every 5s. No log line on the healthy path; the first error of each
+        // death bout is still logged in full, then one summary every 5s.
+        // All of these are touched on VLC's single input thread only, same
+        // as _retriedRead. No Thread.Sleep here: Thread.Sleep is not proven
+        // for this UWP target (Microsoft Learn "Applies to" lists .NET /
+        // .NET Framework / .NET Standard only, no UWP row, unlike
+        // Interlocked.Exchange which lists UWP 10.0), so the dead path spins
+        // cheaply on a flag check + counter instead of sleeping.
+        private bool _dead;
+        private long _deadSinceTicks;
+        private long _deadReadCount;
+        private long _lastSummaryTicks;
+        private long _lastResumeAttemptTicks;
+        private string _lastErrorKind;
+
+        // Same throttling for repeated failed seeks (cheap insurance: a
+        // seek does network I/O, so it cannot flood like Read, but a
+        // demuxer retrying seeks must not log a full stack per attempt).
+        private long _seekFailCount;
+        private long _seekFailSinceTicks;
+        private long _lastSeekFailTicks;
+        private long _lastSeekSummaryTicks;
+        private string _lastSeekErrorKind;
+
         // Stop diagnostics (step 2b): progress counters for the input
         // thread, read by the 5s stop watcher only. Cheap writes, no log
         // lines (Read is a hot path), no branching on them anywhere.
@@ -105,9 +131,31 @@ namespace Nuvio.Playback
         {
             Interlocked.Increment(ref _readCount);
             Interlocked.Exchange(ref _lastReadUtcTicks, DateTime.UtcNow.Ticks);
+            var resumedFromDead = false;
+            long failedReadsBeforeRecovery = 0;
+            var entryPos = _position;
+            if (_dead)
+            {
+                if (TryRearm())
+                {
+                    resumedFromDead = true;
+                    failedReadsBeforeRecovery = _deadReadCount;
+                    _dead = false;
+                    _retriedRead = false;
+                }
+                else
+                {
+                    CountDeadRead();
+                    return -1;
+                }
+            }
             try
             {
                 var read = ReadOnce(len);
+                if (resumedFromDead && read > 0)
+                {
+                    Log.Write("Stream read recovered at " + entryPos + " after " + failedReadsBeforeRecovery + " failed reads");
+                }
                 _retriedRead = false;
                 return read;
             }
@@ -117,7 +165,9 @@ namespace Nuvio.Playback
                 {
                     return -1;
                 }
-                // A dropped connection: pick the download back up where it stopped, once.
+                // A dropped connection: pick the download back up where it stopped.
+                // Rearmed every 5s while dead (TryRearm above); a failed resume
+                // enters the dead state instead of retrying on every Read.
                 if (!_retriedRead && _supportsRanges && (_length == 0 || _position < _length))
                 {
                     _retriedRead = true;
@@ -125,16 +175,31 @@ namespace Nuvio.Playback
                     try
                     {
                         OpenAt(_position);
-                        return ReadOnce(len);
+                        var read = ReadOnce(len);
+                        if (resumedFromDead && read > 0)
+                        {
+                            Log.Write("Stream read recovered at " + entryPos + " after " + failedReadsBeforeRecovery + " failed reads");
+                        }
+                        _retriedRead = false;
+                        return read;
                     }
                     catch (Exception retryEx)
                     {
                         Log.Error("Resuming the stream failed", retryEx);
+                        EnterDead(retryEx);
                     }
                 }
                 else
                 {
-                    Log.Error("Stream read failed", ex);
+                    if (!_dead)
+                    {
+                        Log.Error("Stream read failed", ex);
+                        EnterDead(ex);
+                    }
+                    else
+                    {
+                        CountDeadRead();
+                    }
                 }
                 return -1;
             }
@@ -173,7 +238,31 @@ namespace Nuvio.Playback
             }
             catch (Exception ex)
             {
-                Log.Error("Seeking the stream failed", ex);
+                var now = DateTime.UtcNow;
+                var newBout = _lastSeekFailTicks == 0 || (now - new DateTime(_lastSeekFailTicks)).TotalSeconds >= 5;
+                if (newBout)
+                {
+                    Log.Error("Seeking the stream failed", ex);
+                    _seekFailCount = 1;
+                    _seekFailSinceTicks = now.Ticks;
+                    _lastSeekSummaryTicks = now.Ticks;
+                    _lastSeekErrorKind = ex.GetType().Name;
+                }
+                else
+                {
+                    _seekFailCount++;
+                    _lastSeekErrorKind = ex.GetType().Name;
+                    if ((now - new DateTime(_lastSeekSummaryTicks)).TotalSeconds >= 5)
+                    {
+                        _lastSeekSummaryTicks = now.Ticks;
+                        Log.Write("Seeking the stream still failing at " + _position + " (" + _lastSeekErrorKind + "): " + _seekFailCount + " failed seeks suppressed since " + new DateTime(_seekFailSinceTicks).ToString("HH:mm:ss"));
+                    }
+                }
+                _lastSeekFailTicks = now.Ticks;
+                if (_body != null)
+                {
+                    Log.Write("Seek to " + offset + " failed, keeping previous body at " + _position);
+                }
                 return false;
             }
         }
@@ -191,7 +280,8 @@ namespace Nuvio.Playback
         {
             lock (_sync)
             {
-                CloseResponse();
+                // Swap on success only: the previous body stays alive if any
+                // step below throws, so a failed seek no longer kills the input.
                 if (_aborted)
                 {
                     throw new OperationCanceledException();
@@ -244,7 +334,16 @@ namespace Nuvio.Playback
                 _supportsRanges = false;
             }
 
-            var body = response.Content.ReadAsInputStreamAsync().AsTask().GetAwaiter().GetResult().AsStreamForRead(0);
+            Stream body;
+            try
+            {
+                body = response.Content.ReadAsInputStreamAsync().AsTask().GetAwaiter().GetResult().AsStreamForRead(0);
+            }
+            catch
+            {
+                response.Dispose();
+                throw;
+            }
             lock (_sync)
             {
                 if (_aborted)
@@ -253,9 +352,12 @@ namespace Nuvio.Playback
                     response.Dispose();
                     throw new OperationCanceledException();
                 }
+                CloseResponse();
                 _response = response;
                 _body = body;
                 _position = offset;
+                _dead = false;
+                _retriedRead = false;
             }
         }
 
@@ -265,6 +367,40 @@ namespace Nuvio.Playback
             _body = null;
             _response?.Dispose();
             _response = null;
+        }
+
+        private void EnterDead(Exception ex)
+        {
+            var now = DateTime.UtcNow;
+            _dead = true;
+            _deadSinceTicks = now.Ticks;
+            _deadReadCount = 0;
+            _lastSummaryTicks = now.Ticks;
+            _lastResumeAttemptTicks = now.Ticks;
+            _lastErrorKind = ex.GetType().Name;
+            Log.Write("Stream read dead at " + _position + " (" + _lastErrorKind + "), silent -1 until recovery; reads=0");
+        }
+
+        private void CountDeadRead()
+        {
+            _deadReadCount++;
+            var now = DateTime.UtcNow;
+            if ((now - new DateTime(_lastSummaryTicks)).TotalSeconds >= 5)
+            {
+                _lastSummaryTicks = now.Ticks;
+                Log.Write("Stream read still dead at " + _position + ": " + _deadReadCount + " failed reads suppressed since " + new DateTime(_deadSinceTicks).ToString("HH:mm:ss"));
+            }
+        }
+
+        private bool TryRearm()
+        {
+            var now = DateTime.UtcNow;
+            if ((now - new DateTime(_lastResumeAttemptTicks)).TotalSeconds < 5)
+            {
+                return false;
+            }
+            _lastResumeAttemptTicks = now.Ticks;
+            return true;
         }
 
         private static HttpClient CreateClient()

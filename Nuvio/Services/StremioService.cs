@@ -97,6 +97,12 @@ namespace Nuvio.Services
 
         private const long ManifestRefreshMs = 6 * 60 * 60 * 1000;
         private const int StreamTimeoutMs = 30000;
+        // S1: stream responses carry signed direct links, so a 10-minute
+        // cache can hand back an expired link. Two minutes still dedupes
+        // rapid re-navigation while bounding the stale window. (Invalidating
+        // the entry when an open fails needs the player layer, not this
+        // service, so that part stays deferred.)
+        private const int StreamCacheTtlMs = 2 * 60 * 1000;
 
         private readonly LocalStore _store;
         private readonly List<Func<IReadOnlyList<Addon>>> _providers = new List<Func<IReadOnlyList<Addon>>>();
@@ -719,7 +725,7 @@ namespace Nuvio.Services
         internal async Task<IReadOnlyList<StreamItem>> FetchStreamsHttpAsync(Addon addon, string type, string id)
         {
             var url = ResourceUrl(addon, "stream", type, id, null);
-            var data = await HttpService.GetJsonAsync(url, 10 * 60 * 1000, StreamTimeoutMs).ConfigureAwait(false);
+            var data = await HttpService.GetJsonAsync(url, StreamCacheTtlMs, StreamTimeoutMs).ConfigureAwait(false);
             var result = new List<StreamItem>();
             var obj = JsonHelpers.GetObject(data);
             var streams = obj != null ? JsonHelpers.GetArray(obj, "streams") : null;

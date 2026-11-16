@@ -191,6 +191,11 @@ namespace Nuvio.ViewModels
         private bool _suppressEngineStop;
         private int _consecutiveFailures;
         private int _stallReconnects;
+        // F2: stall sampling — the last position the stall timer saw, when it
+        // saw it, and how much wall time has passed with too little progress.
+        private double _stallCheckPosition = double.NaN;
+        private DateTime _stallCheckAt = DateTime.UtcNow;
+        private double _stallSlowMs;
         private bool _fallbackNoticeShown;
         private bool _sessionStarted;
         private StreamItem _fallbackTarget;
@@ -227,6 +232,13 @@ namespace Nuvio.ViewModels
 
         /// <summary>Raised with the toast text; the page forwards it to the shell.</summary>
         public event Action<string> ToastRequested;
+        /// <summary>Raised before a programmatic navigation (Exit, next
+        /// episode, error fallback) so the page can hide an open menu dialog
+        /// first: navigating while a ContentDialog is open orphans the dialog
+        /// over the next page, and its buttons would call into a disposed
+        /// ViewModel. The page hides the dialog synchronously; navigation
+        /// then proceeds immediately.</summary>
+        public event Action CloseDialogsRequested;
         /// <summary>Raised with a focus hint: "play", "seek", "back", "next", "error".</summary>
         public event Action<string> FocusRequested;
         /// <summary>Raised with the flash glyph ("\uE768" play / "\uE769" pause).</summary>
@@ -531,6 +543,14 @@ namespace Nuvio.ViewModels
             if (handler != null) handler(message);
         }
 
+        /// <summary>D4: asks the page to hide any open menu dialog before a
+        /// programmatic navigation. A no-op when no dialog is open.</summary>
+        private void CloseDialogsBeforeNavigation()
+        {
+            var handler = CloseDialogsRequested;
+            if (handler != null) handler();
+        }
+
         private void RaiseFocus(string hint)
         {
             var handler = FocusRequested;
@@ -660,6 +680,10 @@ namespace Nuvio.ViewModels
             _lastTime = at;
             _lastTimeAt = DateTime.UtcNow;
             _lastSavedAt = DateTime.UtcNow;
+            // F2: a new open restarts the stall baseline (the old position
+            // belongs to the previous source).
+            _stallCheckPosition = double.NaN;
+            _stallSlowMs = 0;
             _player.Open(target, at);
             _openTimer.Interval = TimeSpan.FromSeconds(OpenTimeoutSeconds);
             _openTimer.Start();
@@ -770,6 +794,10 @@ namespace Nuvio.ViewModels
                 Ready = true;
                 _consecutiveFailures = 0;
                 _stallReconnects = 0;
+                // F2: readiness restarts the stall baseline as well (a
+                // re-open after a stall must not inherit the old sample).
+                _stallCheckPosition = double.NaN;
+                _stallSlowMs = 0;
                 Report("start");
                 UpdateLoading();
                 RenderTimeline();
@@ -876,8 +904,44 @@ namespace Nuvio.ViewModels
 
         private void OnStallTimerTick(object sender, object e)
         {
-            if (_closed || _failed || !Ready || PlayState != "playing") return;
-            if ((DateTime.UtcNow - _lastTimeAt).TotalMilliseconds < StallTimeoutMs) return;
+            if (_closed || _failed || !Ready || PlayState != "playing")
+            {
+                // No baseline while not playing: a pause (or a fresh open)
+                // must not count its frozen position as a stall.
+                _stallCheckPosition = double.NaN;
+                _stallSlowMs = 0;
+                return;
+            }
+            // F2: measure position progress, not event arrival. The old check
+            // ((UtcNow - _lastTimeAt) < 15s) could never fire during slow
+            // playback: player.time events arrive steadily (~40/10s) even at
+            // 0.089x, so _lastTimeAt was always fresh. _lastTime is the last
+            // reported position (never wall-clock extrapolated, unlike
+            // CurrentTime()), so its delta over wall time is the true rate.
+            var now = DateTime.UtcNow;
+            var position = _lastTime;
+            if (double.IsNaN(_stallCheckPosition))
+            {
+                _stallCheckPosition = position;
+                _stallCheckAt = now;
+                return;
+            }
+            var wallMs = (now - _stallCheckAt).TotalMilliseconds;
+            var progressSeconds = position - _stallCheckPosition;
+            _stallCheckPosition = position;
+            _stallCheckAt = now;
+            if (wallMs <= 0) return;
+            // Half the requested rate: a 1x stream crawling at 0.089x trips
+            // it, while a deliberate 0.5x speed does not.
+            var expected = Rate > 0 ? Rate : 1;
+            if (progressSeconds / (wallMs / 1000.0) >= 0.5 * expected)
+            {
+                _stallSlowMs = 0;
+                return;
+            }
+            _stallSlowMs += wallMs;
+            if (_stallSlowMs < StallTimeoutMs) return;
+            _stallSlowMs = 0;
             if (_stallReconnects < 1)
             {
                 _stallReconnects++;
@@ -934,6 +998,8 @@ namespace Nuvio.ViewModels
             if (_fallbackToStreams)
             {
                 RequestToast(S("PlayerLinkNoLongerWorks", "That link no longer works. Pick a source."));
+                // D4: hide any open dialog before navigating back to streams.
+                CloseDialogsBeforeNavigation();
                 _navigation.PlayVideo(Meta, Video);
                 return;
             }
@@ -1129,10 +1195,17 @@ namespace Nuvio.ViewModels
 
         public void Scrub(int direction, bool repeat)
         {
+            // D11: no scrub before readiness — with Duration == 0 the old
+            // ceiling was double.MaxValue and CommitScrub passed the target
+            // straight to SeekTo, which only clamps when Duration > 0.
+            if (!Ready) return;
             _scrubRepeat = repeat ? _scrubRepeat + 1 : 0;
             var step = _scrubRepeat > 20 ? 60 : _scrubRepeat > 8 ? 30 : SeekStepSeconds;
             var baseTime = _scrubTarget.HasValue ? _scrubTarget.Value : CurrentTime();
-            var max = Duration > 0 ? Duration : double.MaxValue;
+            // A ready stream with no known duration (live) still has no
+            // ceiling to clamp to: cap forward scrub at the current position
+            // (backward scrub stays possible).
+            var max = Duration > 0 ? Duration : CurrentTime();
             _scrubTarget = Math.Max(0, Math.Min(max, baseTime + direction * step));
             IsScrubbing = true;
             RenderTimeline();
@@ -1291,23 +1364,36 @@ namespace Nuvio.ViewModels
             catch (Exception ex)
             {
                 Log.Error("Loading subtitle cues failed", ex);
-                RequestToast(S("PlayerSubtitlesCouldNotLoad", "Couldn't load those subtitles"));
-                if (ActiveAddonSub == sub)
+                // D5: this continuation runs on a pool thread (the await
+                // above uses ConfigureAwait(false)), so the toast and the
+                // bound-state reset must be marshalled to the UI thread,
+                // as LoadAddonSubtitlesInnerAsync already does.
+                await RunOnUi(() =>
                 {
-                    ActiveAddonSub = null;
-                    _activeCues = null;
-                    RenderSubtitles();
-                }
+                    RequestToast(S("PlayerSubtitlesCouldNotLoad", "Couldn't load those subtitles"));
+                    if (ActiveAddonSub == sub)
+                    {
+                        ActiveAddonSub = null;
+                        _activeCues = null;
+                        RenderSubtitles();
+                    }
+                }).ConfigureAwait(false);
                 return;
             }
             if (_closed) return;
-            if (ActiveAddonSub == sub)
+            // D5: same marshalling for the success path — RenderSubtitles
+            // sets the XAML-bound CurrentSubtitleText. The identity check
+            // sits inside the dispatch so a subtitle picked meanwhile wins.
+            await RunOnUi(() =>
             {
-                sub.Cues = cues;
-                sub.CuesLoaded = true;
-                _activeCues = cues;
-                RenderSubtitles();
-            }
+                if (ActiveAddonSub == sub)
+                {
+                    sub.Cues = cues;
+                    sub.CuesLoaded = true;
+                    _activeCues = cues;
+                    RenderSubtitles();
+                }
+            }).ConfigureAwait(false);
         }
 
         private void ApplyTrackPreferences()
@@ -1787,7 +1873,11 @@ namespace Nuvio.ViewModels
                 }
                 if (target == null)
                 {
-                    RequestToast(S("PlayerNoNextEpisode", "There is no next episode yet"));
+                    // D1: this continuation runs on a pool thread (the awaits
+                    // above use ConfigureAwait(false)), so the toast — a
+                    // DependencyObject touch via ToastRequested — must be
+                    // marshalled to the UI thread like the navigation below.
+                    await RunOnUi(() => RequestToast(S("PlayerNoNextEpisode", "There is no next episode yet"))).ConfigureAwait(false);
                     return;
                 }
             }
@@ -1833,11 +1923,26 @@ namespace Nuvio.ViewModels
                 // The old page's Dispose runs after the new page opens the
                 // player; it must not stop the engine out from under it.
                 _suppressEngineStop = true;
-                _navigation.OpenPlayer(full, next, picked, siblings, restart: false, fallbackToStreams: false);
+                // D1: this continuation runs on a pool thread (FetchStreamsAsync
+                // and FindNextVideoAsync above both use ConfigureAwait(false)),
+                // and Frame.Navigate throws RPC_E_WRONG_THREAD off the UI
+                // thread — so the navigation is marshalled via RunOnUi, the
+                // same helper StartNextCountdownAsync already uses.
+                await RunOnUi(() =>
+                {
+                    // D4: hide any open dialog before leaving the page.
+                    CloseDialogsBeforeNavigation();
+                    _navigation.OpenPlayer(full, next, picked, siblings, restart: false, fallbackToStreams: false);
+                }).ConfigureAwait(false);
             }
             else
             {
-                _navigation.PlayVideo(full, next);
+                await RunOnUi(() =>
+                {
+                    // D4: hide any open dialog before leaving the page.
+                    CloseDialogsBeforeNavigation();
+                    _navigation.PlayVideo(full, next);
+                }).ConfigureAwait(false);
             }
         }
 
@@ -1846,6 +1951,9 @@ namespace Nuvio.ViewModels
         public void Exit()
         {
             if (_closed) return;
+            // D4: a dialog may be open (e.g. the film ended while a subtitle
+            // menu was up) — hide it before leaving the page.
+            CloseDialogsBeforeNavigation();
             CommitScrub();
             Save(true);
             Report("stop");

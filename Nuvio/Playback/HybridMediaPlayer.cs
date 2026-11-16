@@ -135,6 +135,17 @@ namespace Nuvio.Playback
             if (_bothFailedUrls.Contains(request.Url))
             {
                 Log.Write("Skipping source both players already failed to play (host " + HostOf(request.Url) + ")");
+                // D3: the previous source may still be playing on either
+                // engine — stop both before reporting the error, so no old
+                // audio plays behind the error box. The engines are stopped
+                // directly (not via Stop(), which would also clear the page
+                // id the error payload below needs).
+                _active = ActiveEngine.None;
+                try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg for a failed-source error failed", ex); }
+                if (_vlc != null)
+                {
+                    try { _vlc.Stop(); } catch (Exception ex) { Log.Error("Stopping VLC for a failed-source error failed", ex); }
+                }
                 RaiseState("error", "Neither FFmpeg nor VLC could play this stream.");
                 RaiseEnded("error", "Neither FFmpeg nor VLC could play this stream.");
                 return;
@@ -159,6 +170,11 @@ namespace Nuvio.Playback
             if (_primaryFailedUrls.Contains(request.Url))
             {
                 Log.Write("FFmpeg previously failed for this source; starting with VLC (host " + HostOf(request.Url) + ")");
+                // D2: the primary may still be playing another source — this
+                // branch skipped the forced-vlc stop above, so stop it first
+                // (mirroring that branch) or both engines play at once, with
+                // the old audio hidden behind the VLC surface.
+                try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg for a VLC open failed", ex); }
                 OpenWithVlc(request, _lastTimeSeconds, true);
                 return;
             }
@@ -389,8 +405,89 @@ namespace Nuvio.Playback
                     _bothFailedUrls.Add(url);
                     CapRememberedUrls();
                 }
+                // D7: stop VLC now that it has failed, instead of leaving it
+                // to the next source (up to 1.5s later) — a late-starting VLC
+                // could otherwise play audio after the failure was already
+                // reported. This is the hybrid-layer equivalent of stopping
+                // inside FailVlcOpen itself (VlcPlayer.cs, owned by the VLC
+                // worker): the failure is taken here the moment it surfaces.
+                StopVlcAfterError();
+                // D12: hide the VLC surface on failure, so a frozen old
+                // frame does not sit behind the error box. (Not applied to
+                // a natural end — reason "eof" never reaches this branch —
+                // where the last frame behind the next-episode card is
+                // intended. FFmpeg already hides its surface on failure.)
+                HideVlcViewAfterError();
             }
             EventRaised?.Invoke(type, payload);
+        }
+
+        /// <summary>
+        /// D7: stops VLC after its error surfaced. VlcPlayer.Stop only queues
+        /// the worker stop and hides the surface synchronously, so it never
+        /// blocks this thread; a stop queued behind a stuck open runs when
+        /// the open finishes, which is what keeps a late Playing from ever
+        /// sounding. VLC raises ended on the UI thread (via RunOnUi), so the
+        /// stop is normally direct; if a future raise path ever arrives off
+        /// the UI thread it is dispatched instead — it still lands long
+        /// before the 1.5s fallback timer can open anything, so it cannot
+        /// stop a newer playback.
+        /// </summary>
+        private void StopVlcAfterError()
+        {
+            if (_disposed || _vlc == null) return;
+            if (_dispatcher.HasThreadAccess)
+            {
+                try { _vlc.Stop(); } catch (Exception ex) { Log.Error("Stopping VLC after its error failed", ex); }
+                return;
+            }
+            try
+            {
+                var _ = _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                {
+                    if (_disposed || _vlc == null) return;
+                    try { _vlc.Stop(); } catch (Exception ex) { Log.Error("Stopping VLC after its error failed", ex); }
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Stopping VLC after its error failed", ex);
+            }
+        }
+
+        /// <summary>
+        /// D12: hides the VLC surface when VLC fails. The D7 stop above
+        /// normally hides it already (its BeginTransition raises
+        /// VideoVisibleChanged(false)); this is the explicit guarantee, so
+        /// the surface does not depend on that side effect. Same thread rule
+        /// as StopVlcAfterError: direct on the UI thread, dispatched
+        /// otherwise.
+        /// </summary>
+        private void HideVlcViewAfterError()
+        {
+            if (_disposed || _vlcView == null) return;
+            if (_dispatcher.HasThreadAccess)
+            {
+                HideVlcView();
+                return;
+            }
+            try
+            {
+                var _ = _dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                {
+                    if (!_disposed && _vlcView != null) HideVlcView();
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Hiding the VLC video view after its error failed", ex);
+            }
+        }
+
+        private void HideVlcView()
+        {
+            _vlcView.Opacity = 0;
+            try { _vlcView.Clear(); } catch (Exception ex) { Log.Error("Clearing the VLC video view failed", ex); }
         }
 
         private void TryFallbackToVlc(JsonObject primaryEnded)

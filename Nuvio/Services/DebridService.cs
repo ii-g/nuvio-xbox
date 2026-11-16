@@ -1,10 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Nuvio.Core;
+using Nuvio.Diagnostics;
 using Nuvio.Models;
 using Windows.Data.Json;
 
@@ -65,6 +69,20 @@ namespace Nuvio.Services
             RegexOptions.IgnoreCase);
         private const int CacheTtlMs = 15 * 60 * 1000;
         private const int TimeoutMs = 30000;
+        // S3: a cached link is probed before reuse. Links minted seconds ago
+        // are trusted outright; older ones get a ranged probe, and only a
+        // definitive rejection drops the entry. The probe is capped at 5s so
+        // a hung host can delay a cached play by at most that long.
+        private const int ProbeGraceMs = 60 * 1000;
+        private const int ProbeTimeoutMs = 5000;
+        private static readonly HttpClient ProbeClient = CreateProbeClient();
+
+        private static HttpClient CreateProbeClient()
+        {
+            var client = new HttpClient();
+            client.DefaultRequestHeaders.UserAgent.TryParseAdd("NuvioUWP");
+            return client;
+        }
         private const string FormContentType = "application/x-www-form-urlencoded";
 
         private readonly AppSettings _settings;
@@ -203,10 +221,32 @@ namespace Nuvio.Services
                 + (fileIdx.HasValue ? fileIdx.Value.ToString(CultureInfo.InvariantCulture) : string.Empty) + "|"
                 + (season.HasValue ? season.Value.ToString(CultureInfo.InvariantCulture) : string.Empty) + "|"
                 + (episode.HasValue ? episode.Value.ToString(CultureInfo.InvariantCulture) : string.Empty);
+            CacheEntry hit = null;
             lock (_cacheSync)
             {
-                CacheEntry hit;
-                if (_cache.TryGetValue(key, out hit) && (DateTimeOffset.UtcNow - hit.At).TotalMilliseconds < CacheTtlMs)
+                CacheEntry found;
+                if (_cache.TryGetValue(key, out found) && (DateTimeOffset.UtcNow - found.At).TotalMilliseconds < CacheTtlMs)
+                {
+                    hit = found;
+                }
+            }
+            if (hit != null)
+            {
+                // S3: check the cached link is still alive before reusing it.
+                // Fresh links skip the probe; older ones are dropped only on
+                // a definitive rejection, so a probe failure can never break
+                // a working playback — it just falls back to a fresh resolve.
+                var ageMs = (DateTimeOffset.UtcNow - hit.At).TotalMilliseconds;
+                if (ageMs < ProbeGraceMs) return hit.Result;
+                if (await IsLinkDeadAsync(hit.Result.Url).ConfigureAwait(false))
+                {
+                    lock (_cacheSync)
+                    {
+                        _cache.Remove(key);
+                    }
+                    Log.Write("Dropping expired debrid link for host " + HostOf(hit.Result.Url) + "; resolving again");
+                }
+                else
                 {
                     return hit.Result;
                 }
@@ -230,6 +270,43 @@ namespace Nuvio.Services
                 _cache[key] = new CacheEntry { At = DateTimeOffset.UtcNow, Result = result };
             }
             return result;
+        }
+
+        /// <summary>True only when the cached link is definitively rejected
+        /// (401/403/404/410 on a 0-0 range probe). Success, any other status,
+        /// a network error or a timeout all return false, so the cached link
+        /// is kept: the probe may only drop a link, never a playback.</summary>
+        private static async Task<bool> IsLinkDeadAsync(string url)
+        {
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+                {
+                    request.Headers.Range = new RangeHeaderValue(0, 0);
+                    using (var cts = new CancellationTokenSource(ProbeTimeoutMs))
+                    using (var response = await ProbeClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false))
+                    {
+                        var status = (int)response.StatusCode;
+                        return status == 401 || status == 403 || status == 404 || status == 410;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static string HostOf(string url)
+        {
+            try
+            {
+                return new Uri(url).Host;
+            }
+            catch (Exception)
+            {
+                return "(unknown)";
+            }
         }
 
         /// <summary>magnet:?xt=urn:btih:&lt;infoHash&gt; + dn + one tr per tracker source.</summary>

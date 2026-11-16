@@ -20,6 +20,15 @@ namespace Nuvio.Playback
         // Larger sequential ranges reduce request/round-trip stalls on high-bitrate Xbox playback.
         // The response body is streamed, so this does not buffer the whole range in memory.
         private const int RangeSize = 4 * 1024 * 1024;
+        // R1: a transient range failure must not kill the open. Log 33 showed
+        // the same URL failing HTTP 500 and then succeeding ~11s later, so a
+        // failed round-trip gets bounded retries with backoff instead of
+        // failing the open at once. Non-transient statuses fail immediately.
+        private const int MaxRangeAttempts = 3;
+        private const int MaxRetryWaitMs = 5000;
+        // R2: how many times a 0-byte read mid-range reopens the range
+        // before failing loudly instead of ending playback silently.
+        private const int MaxZeroReadReopens = 2;
         private readonly HttpClient _client;
         private readonly Uri _uri;
         private readonly SemaphoreSlim _readGate = new SemaphoreSlim(1, 1);
@@ -64,7 +73,7 @@ namespace Nuvio.Playback
             var client = new HttpClient(handler);
             try
             {
-                AddDefaultHeaders(client, headers);
+                AddDefaultHeaders(client, headers, uri);
                 long? length = null;
                 string contentType = null;
 
@@ -136,7 +145,7 @@ namespace Nuvio.Playback
             }
         }
 
-        private static void AddDefaultHeaders(HttpClient client, IDictionary<string, string> headers)
+        private static void AddDefaultHeaders(HttpClient client, IDictionary<string, string> headers, Uri uri)
         {
             var hasUserAgent = false;
             if (headers != null)
@@ -146,14 +155,41 @@ namespace Nuvio.Playback
                     if (string.IsNullOrWhiteSpace(header.Key) ||
                         header.Key.Equals("Range", StringComparison.OrdinalIgnoreCase))
                         continue;
-                    if (header.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase)) hasUserAgent = true;
 
-                    if (!client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value ?? string.Empty))
-                        throw new InvalidOperationException("The media request header '" + header.Key + "' cannot be applied by the native HTTP stack.");
+                    // R4: one bad header from addon data must not kill the
+                    // open. Skip it, log its name only (never its value),
+                    // and continue with the remaining headers.
+                    bool applied;
+                    try
+                    {
+                        applied = client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value ?? string.Empty);
+                    }
+                    catch (Exception)
+                    {
+                        applied = false;
+                    }
+                    if (!applied)
+                    {
+                        Log.Write("Skipping media request header '" + SafeHeaderName(header.Key) + "' for host " + uri.Host + ": the native HTTP stack cannot apply it");
+                        continue;
+                    }
+                    if (header.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase)) hasUserAgent = true;
                 }
             }
             // Some origins (and CDNs) reject requests with no User-Agent at all.
             if (!hasUserAgent) client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "NuvioUWP");
+        }
+
+        // Header names come from addon data, so only a plain token-shaped
+        // name is ever written to the log; anything else is not logged.
+        private static string SafeHeaderName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "(empty)";
+            foreach (var c in name)
+            {
+                if (!(char.IsLetterOrDigit(c) || c == '-' || c == '_')) return "(invalid header name)";
+            }
+            return name;
         }
 
         public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
@@ -169,15 +205,36 @@ namespace Nuvio.Playback
             try
             {
                 if (_position >= Length) return 0;
-                if (_responseStream == null || _position != _responsePosition || _position >= _responseEnd)
-                    await OpenRangeAsync(cancellationToken, gateWaitMs);
+                // R2: a 0-byte read before the end of the range means the
+                // response was cut short, not end-of-stream. Reopen the
+                // range from _position and continue; after bounded reopens
+                // fail loudly so FFmpeg reports an error instead of ending
+                // playback silently. A genuine end of range (available <= 0,
+                // e.g. after a 416) still returns 0 as before.
+                var zeroReopens = 0;
+                while (true)
+                {
+                    if (_responseStream == null || _position != _responsePosition || _position >= _responseEnd)
+                        await OpenRangeAsync(cancellationToken, gateWaitMs);
 
-                var available = (int)Math.Min(count, Math.Min(int.MaxValue, _responseEnd - _position));
-                if (available <= 0) return 0;
-                var read = await _responseStream.ReadAsync(buffer, offset, available, cancellationToken);
-                _position += read;
-                _responsePosition += read;
-                return read;
+                    var available = (int)Math.Min(count, Math.Min(int.MaxValue, _responseEnd - _position));
+                    if (available <= 0) return 0;
+                    var read = await _responseStream.ReadAsync(buffer, offset, available, cancellationToken);
+                    if (read > 0)
+                    {
+                        _position += read;
+                        _responsePosition += read;
+                        return read;
+                    }
+                    if (zeroReopens >= MaxZeroReadReopens)
+                    {
+                        Log.Write("FFmpeg range read ended early for host " + _uri.Host + " at byte " + _position + " after " + (zeroReopens + 1) + " empty reads; failing the read instead of ending playback");
+                        throw new IOException("The media response ended before the requested range was complete.");
+                    }
+                    zeroReopens++;
+                    Log.Write("FFmpeg range read returned 0 bytes for host " + _uri.Host + " at byte " + _position + " before the end of the range; reopening the range (attempt " + zeroReopens + "/" + MaxZeroReadReopens + ")");
+                    CloseResponse();
+                }
             }
             finally
             {
@@ -190,28 +247,69 @@ namespace Nuvio.Playback
             CloseResponse();
             var start = _position;
             var end = Math.Min(Length - 1, start + RangeSize - 1);
-            var request = new HttpRequestMessage(HttpMethod.Get, _uri);
-            request.Headers.Range = new RangeHeaderValue(start, end);
             HttpResponseMessage response = null;
+            var attempt = 0;
+
+            // Retry loop: only the range request itself is retried, and only
+            // for transient failures (5xx/429/408 or a network blip). A 416
+            // returns at once (end of stream), other 4xx fail at once, and
+            // body handling below (wrong offset, skip cap) is deterministic
+            // so it is never retried.
+            while (true)
+            {
+                attempt++;
+                var request = new HttpRequestMessage(HttpMethod.Get, _uri);
+                request.Headers.Range = new RangeHeaderValue(start, end);
+                try
+                {
+                    var getStart = Environment.TickCount;
+                    try
+                    {
+                        response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                    }
+                    catch (HttpRequestException ex) when (attempt < MaxRangeAttempts)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        var blipWaitMs = RetryBackoffMs(attempt);
+                        Log.Write("FFmpeg range read failed for host " + _uri.Host + ": " + ex.Message + " (attempt " + attempt + "/" + MaxRangeAttempts + "), retrying in " + blipWaitMs + "ms");
+                        request.Dispose();
+                        await Task.Delay(blipWaitMs, token);
+                        continue;
+                    }
+                    var getMs = Environment.TickCount - getStart;
+                    Log.Write("FFmpeg range read: bytes=" + start + "-" + end + " getMs=" + getMs + " gateWaitMs=" + gateWaitMs);
+                    request.Dispose();
+                    if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+                    {
+                        // Past the end of a stream whose length was never reported:
+                        // signal end-of-stream instead of failing the read.
+                        _responseEnd = _position;
+                        _responsePosition = _position;
+                        response.Dispose();
+                        return;
+                    }
+                    if (response.IsSuccessStatusCode) break;
+                    var status = (int)response.StatusCode;
+                    if (!IsTransientStatus(status) || attempt >= MaxRangeAttempts)
+                    {
+                        response.EnsureSuccessStatusCode();
+                    }
+                    var waitMs = RetryWaitMs(response, attempt);
+                    Log.Write("FFmpeg range read failed for host " + _uri.Host + ": HTTP " + status + " (attempt " + attempt + "/" + MaxRangeAttempts + "), retrying in " + waitMs + "ms");
+                    response.Dispose();
+                    response = null;
+                    await Task.Delay(waitMs, token);
+                }
+                catch
+                {
+                    request.Dispose();
+                    response?.Dispose();
+                    throw;
+                }
+            }
 
             try
             {
-                var getStart = Environment.TickCount;
-                response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
-                var getMs = Environment.TickCount - getStart;
-                Log.Write("FFmpeg range read: bytes=" + start + "-" + end + " getMs=" + getMs + " gateWaitMs=" + gateWaitMs);
-                request.Dispose();
-                if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
-                {
-                    // Past the end of a stream whose length was never reported:
-                    // signal end-of-stream instead of failing the read.
-                    _responseEnd = _position;
-                    _responsePosition = _position;
-                    response.Dispose();
-                    return;
-                }
-                response.EnsureSuccessStatusCode();
-
                 var stream = await response.Content.ReadAsStreamAsync();
                 if (response.StatusCode == HttpStatusCode.PartialContent)
                 {
@@ -242,21 +340,63 @@ namespace Nuvio.Playback
             }
             catch
             {
-                request.Dispose();
                 response?.Dispose();
                 throw;
             }
         }
 
-        private static async Task SkipAsync(Stream stream, long bytes, CancellationToken token)
+        private static bool IsTransientStatus(int status)
+        {
+            return status == 408 || status == 429 || (status >= 500 && status < 600);
+        }
+
+        private static int RetryBackoffMs(int attempt)
+        {
+            return attempt <= 1 ? 500 : 1000;
+        }
+
+        private static int RetryWaitMs(HttpResponseMessage response, int attempt)
+        {
+            var waitMs = RetryBackoffMs(attempt);
+            var retryAfter = RetryAfterSeconds(response);
+            if (retryAfter.HasValue)
+                waitMs = Math.Max(waitMs, (int)Math.Min(MaxRetryWaitMs, retryAfter.Value * 1000));
+            return Math.Min(waitMs, MaxRetryWaitMs);
+        }
+
+        // Same Retry-After reading as HttpService: a delta in seconds, or an
+        // absolute date. Only the numeric wait is ever logged, never headers.
+        private static double? RetryAfterSeconds(HttpResponseMessage response)
+        {
+            var retry = response.Headers.RetryAfter;
+            if (retry == null) return null;
+            if (retry.Delta.HasValue) return Math.Max(0, retry.Delta.Value.TotalSeconds);
+            if (retry.Date.HasValue) return Math.Max(0, (retry.Date.Value - DateTimeOffset.UtcNow).TotalSeconds);
+            return null;
+        }
+
+        // R3: cap for skipping past a server that ignores Range. Without
+        // one, a late seek in a multi-GB file downloads gigabytes before
+        // resuming. 32 MB still covers header/probe seeks and short resumes
+        // while a deep seek on a range-less server fails fast and loudly.
+        private const long MaxSkipBytes = 32L * 1024 * 1024;
+
+        private async Task SkipAsync(Stream stream, long bytes, CancellationToken token)
         {
             var scratch = new byte[32 * 1024];
-            while (bytes > 0)
+            var skipped = 0L;
+            while (skipped < bytes)
             {
                 token.ThrowIfCancellationRequested();
-                var read = await stream.ReadAsync(scratch, 0, (int)Math.Min(scratch.Length, bytes), token);
+                var allowance = MaxSkipBytes - skipped;
+                if (allowance <= 0)
+                {
+                    Log.Write("FFmpeg range skip gave up for host " + _uri.Host + ": the server ignores byte ranges and the seek target is " + bytes + " bytes in, past the " + MaxSkipBytes + "-byte skip limit");
+                    throw new IOException("The server ignores byte ranges and the seek position is beyond the skip limit.");
+                }
+                var read = await stream.ReadAsync(scratch, 0, (int)Math.Min(scratch.Length, Math.Min(bytes - skipped, allowance)), token);
                 if (read <= 0) throw new EndOfStreamException("The server ended the media before the requested seek position.");
-                bytes -= read;
+                skipped += read;
             }
         }
 

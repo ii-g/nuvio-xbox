@@ -43,6 +43,9 @@ namespace Nuvio.Views
         private readonly ResourceLoader _strings = ResourceLoader.GetForViewIndependentUse("Resources");
         private PlayerNavigation _navigationParam;
         private bool _pointerSeeked;
+        // D4: the menu dialog currently shown by ShowMenuDialogAsync, if any —
+        // tracked so a programmatic navigation can hide it first.
+        private ContentDialog _currentMenuDialog;
 
         public PlayerPage()
         {
@@ -52,6 +55,7 @@ namespace Nuvio.Views
             DataContext = _viewModel;
             _viewModel.PropertyChanged += OnViewModelPropertyChanged;
             _viewModel.ToastRequested += OnToastRequested;
+            _viewModel.CloseDialogsRequested += OnCloseDialogsRequested;
             _viewModel.FocusRequested += OnFocusRequested;
             _viewModel.FlashRequested += OnFlashRequested;
             _viewModel.DelayMenuRequested += OnDelayMenuRequested;
@@ -186,6 +190,27 @@ namespace Nuvio.Views
         {
             var shell = MainPage.Current;
             if (shell != null) shell.ShowToast(message);
+        }
+
+        // D4: the ViewModel navigates programmatically (end of film, next
+        // episode, error fallback) with no regard for an open menu dialog.
+        // Hide it first: navigating with a ContentDialog open orphans the
+        // dialog over the next page, and its buttons call into a disposed
+        // ViewModel. Hide() is safe while the dialog is showing; the
+        // ShowAsync await then completes and its finally clears the flags.
+        private void OnCloseDialogsRequested()
+        {
+            var dialog = _currentMenuDialog;
+            if (dialog == null) return;
+            try
+            {
+                dialog.Hide();
+                Log.Write("Menu dialog hidden for programmatic navigation");
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Menu dialog Hide failed: " + ex.GetType().Name);
+            }
         }
 
         private void OnFocusRequested(string hint)
@@ -800,6 +825,7 @@ namespace Nuvio.Views
             var invoker = FocusManager.GetFocusedElement() as UIElement;
             shell.DialogOpen = true;
             _viewModel.MenuOpen = true;
+            _currentMenuDialog = dialog;
             try
             {
                 try
@@ -820,6 +846,7 @@ namespace Nuvio.Views
             }
             finally
             {
+                _currentMenuDialog = null;
                 shell.DialogOpen = false;
                 _viewModel.MenuOpen = false;
                 RestoreDialogInvoker(invoker);

@@ -621,6 +621,11 @@ namespace Nuvio
             Log.Write("Creating the VLC video surface");
             FindName(nameof(VideoView));
             var vlcView = VideoView;
+            // D9: unsubscribe first — a reload reuses the same element, so a
+            // plain += would stack a duplicate subscription per reload
+            // (repeated "VLC video surface ready" lines and repeated
+            // SetVlcSwapChainOptions calls).
+            VideoView.Initialized -= VideoView_Initialized;
             VideoView.Initialized += VideoView_Initialized;
             return vlcView;
         }
@@ -630,9 +635,13 @@ namespace Nuvio
         // and reload it, so the next LibVLC instance renders into a fresh
         // chain instead of the one the abandoned vout still references.
         // Runs on the UI thread (raised through the hybrid player's
-        // dispatcher). If the unload or the reload fails, layer 2 stops
-        // here: the old view is left in place and the failure is logged;
-        // playback continues on the old chain exactly as before.
+        // dispatcher). If the unload itself fails, layer 2 stops here:
+        // the old view is left in place and the failure is logged, so
+        // playback continues on the old chain exactly as before. But if
+        // the unload succeeded and the reload then fails, the old chain
+        // is already gone: the reload is retried once, and if that fails
+        // too VLC is marked unavailable, so a later open fails with a
+        // message instead of playing on a destroyed view.
         private void ReloadVlcVideoView(long stopSeq, long epoch)
         {
             Log.Write("VLC video surface unload requested (stop=" + stopSeq + " epoch=" + epoch + ")");
@@ -656,7 +665,21 @@ namespace Nuvio
             catch (Exception ex)
             {
                 Log.Error("VLC video surface reload failed", ex);
-                return;
+                // The unload above already destroyed the old chain, so
+                // returning here would leave later opens playing on a
+                // destroyed view. Retry the load once; if that fails too,
+                // mark VLC unavailable so opens fail with a message.
+                try
+                {
+                    reloaded = CreateVlcVideoView();
+                    Log.Write("VLC video surface reloaded after retry (stop=" + stopSeq + " epoch=" + epoch + " took=" + (long)(DateTime.UtcNow - started).TotalMilliseconds + "ms)");
+                }
+                catch (Exception retryEx)
+                {
+                    Log.Error("VLC video surface reload failed", retryEx);
+                    _player.SetVlcUnavailable("the VLC video surface could not be reloaded after unload (" + retryEx.Message + ")");
+                    return;
+                }
             }
             // The hybrid player still holds the unloaded element: point it
             // at the new one (and clear its attached-player record) before
