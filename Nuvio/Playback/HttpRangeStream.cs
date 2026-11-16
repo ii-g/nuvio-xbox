@@ -10,6 +10,23 @@ using Nuvio.Diagnostics;
 
 namespace Nuvio.Playback
 {
+    /// <summary>Thrown when a range request is answered HTTP 416 (the
+    /// requested start is past the server's end of the media). Only the
+    /// first 416 per stream throws; later ones stay silent end-of-stream
+    /// (see OpenRangeAsync). Carries positions only — no URL, no headers.</summary>
+    internal sealed class HttpRangeNotSatisfiableException : IOException
+    {
+        public HttpRangeNotSatisfiableException(long position, long length)
+            : base("The server returned HTTP 416 for a range starting at byte " + position + ".")
+        {
+            Position = position;
+            Length = length;
+        }
+
+        public long Position { get; }
+        public long Length { get; }
+    }
+
     /// <summary>
     /// Seekable HTTP stream for media sources that need request headers. It requests bounded byte
     /// ranges, so playback does not buffer an entire video in memory. Servers that ignore Range are
@@ -29,6 +46,13 @@ namespace Nuvio.Playback
         // R2: how many times a 0-byte read mid-range reopens the range
         // before failing loudly instead of ending playback silently.
         private const int MaxZeroReadReopens = 2;
+        // 6.6: bound on the headers phase of one request (15s). The linked
+        // token cancels only SendAsync with ResponseHeadersRead, which
+        // completes on headers — a slow-but-healthy 4MB body download is
+        // never cut short by it. No HttpClient.Timeout: that would bound
+        // the whole body download (4MB in 15s needs ~2.1 Mbps) and turn
+        // a slow connection into a failed open.
+        private const int HeaderTimeoutSeconds = 15;
         private readonly HttpClient _client;
         private readonly Uri _uri;
         private readonly SemaphoreSlim _readGate = new SemaphoreSlim(1, 1);
@@ -38,6 +62,10 @@ namespace Nuvio.Playback
         private long _responsePosition;
         private long _responseEnd;
         private bool _disposed;
+        // 6.1b: the first 416 per stream throws (the player reopens the
+        // source from byte 0 once); later 416s stay silent end-of-stream.
+        // A fresh instance is created per source, so no explicit reset.
+        private bool _retriedFromZeroOn416;
 
         private HttpRangeStream(HttpClient client, Uri uri, long length, string contentType)
         {
@@ -67,6 +95,27 @@ namespace Nuvio.Playback
             set { Seek(value, SeekOrigin.Begin); }
         }
 
+        /// <summary>Sends one request with a 15s bound on the headers
+        /// phase only (see HeaderTimeoutSeconds). A timeout throws
+        /// TimeoutException; a caller cancellation rethrows the original
+        /// cancellation, so the two are never confused.</summary>
+        private static async Task<HttpResponseMessage> SendWithHeaderTimeoutAsync(HttpClient client, HttpRequestMessage request, CancellationToken token)
+        {
+            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                timeout.CancelAfter(TimeSpan.FromSeconds(HeaderTimeoutSeconds));
+                try
+                {
+                    return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (token.IsCancellationRequested) throw;
+                    throw new TimeoutException("The media request timed out after 15s waiting for response headers.");
+                }
+            }
+        }
+
         public static async Task<HttpRangeStream> CreateAsync(Uri uri, IDictionary<string, string> headers, CancellationToken token)
         {
             var handler = new HttpClientHandler { AllowAutoRedirect = true };
@@ -82,7 +131,7 @@ namespace Nuvio.Playback
                 try
                 {
                     using (var head = new HttpRequestMessage(HttpMethod.Head, uri))
-                    using (var response = await client.SendAsync(head, HttpCompletionOption.ResponseHeadersRead, token))
+                    using (var response = await SendWithHeaderTimeoutAsync(client, head, token))
                     {
                         if (response.IsSuccessStatusCode)
                         {
@@ -90,6 +139,10 @@ namespace Nuvio.Playback
                             contentType = response.Content.Headers.ContentType == null ? null : response.Content.Headers.ContentType.MediaType;
                         }
                     }
+                }
+                catch (TimeoutException)
+                {
+                    Log.Write("Media HEAD request timed out after 15s for host " + uri.Host + "; continuing with a range probe");
                 }
                 catch (Exception ex) when (!(ex is OperationCanceledException))
                 {
@@ -106,7 +159,7 @@ namespace Nuvio.Playback
                         using (var probe = new HttpRequestMessage(HttpMethod.Get, uri))
                         {
                             probe.Headers.Range = new RangeHeaderValue(0, 0);
-                            using (var response = await client.SendAsync(probe, HttpCompletionOption.ResponseHeadersRead, token))
+                            using (var response = await SendWithHeaderTimeoutAsync(client, probe, token))
                             {
                                 if (response.IsSuccessStatusCode)
                                 {
@@ -123,6 +176,10 @@ namespace Nuvio.Playback
                                 }
                             }
                         }
+                    }
+                    catch (TimeoutException)
+                    {
+                        Log.Write("Media range probe timed out after 15s for host " + uri.Host + "; continuing without a known length");
                     }
                     catch (Exception ex) when (!(ex is OperationCanceledException))
                     {
@@ -265,7 +322,7 @@ namespace Nuvio.Playback
                     var getStart = Environment.TickCount;
                     try
                     {
-                        response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+                        response = await SendWithHeaderTimeoutAsync(_client, request, token);
                     }
                     catch (HttpRequestException ex) when (attempt < MaxRangeAttempts)
                     {
@@ -276,11 +333,34 @@ namespace Nuvio.Playback
                         await Task.Delay(blipWaitMs, token);
                         continue;
                     }
+                    catch (TimeoutException) when (attempt < MaxRangeAttempts)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        var timeoutWaitMs = RetryBackoffMs(attempt);
+                        Log.Write("FFmpeg range request timed out after 15s waiting for headers for host " + _uri.Host + " (bytes=" + start + "-" + end + " attempt " + attempt + "/" + MaxRangeAttempts + "), retrying in " + timeoutWaitMs + "ms");
+                        request.Dispose();
+                        await Task.Delay(timeoutWaitMs, token);
+                        continue;
+                    }
                     var getMs = Environment.TickCount - getStart;
                     Log.Write("FFmpeg range read: bytes=" + start + "-" + end + " getMs=" + getMs + " gateWaitMs=" + gateWaitMs);
                     request.Dispose();
                     if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                     {
+                        if (!_retriedFromZeroOn416)
+                        {
+                            // The requested start is past the server's end
+                            // of the media (stale length, or a resume past
+                            // the end): throw once so the player can reopen
+                            // the source from byte 0 instead of reading a
+                            // silent end-of-stream. A later 416 stays EOF.
+                            _retriedFromZeroOn416 = true;
+                            var at = start;
+                            var knownLength = Length;
+                            response.Dispose();
+                            Log.Write("FFmpeg range request returned HTTP 416 for host " + _uri.Host + " at byte " + at + " (length=" + knownLength + "); retrying the source from byte 0 once");
+                            throw new HttpRangeNotSatisfiableException(at, knownLength);
+                        }
                         // Past the end of a stream whose length was never reported:
                         // signal end-of-stream instead of failing the read.
                         _responseEnd = _position;
@@ -445,7 +525,19 @@ namespace Nuvio.Playback
                     break;
                 default: throw new ArgumentOutOfRangeException(nameof(origin));
             }
-            if (target < 0 || target > Length) throw new ArgumentOutOfRangeException(nameof(offset));
+            if (target < 0 || target > Length)
+            {
+                // 6.1a: clamp instead of throwing — the framework asks for
+                // positions past the end (a resume past a shorter file), and
+                // a throw there kills the open. The original target is
+                // logged: a clamp turns an explicit seek failure into a
+                // clean end-of-stream, so the log must show what was asked.
+                // Length == long.MaxValue (unknown length) never clamps.
+                Log.Write("FFmpeg seek clamped: requested=" + target + " length=" + Length +
+                    " clamped=" + Math.Max(0, Math.Min(target, Length)) + " host=" + _uri.Host);
+            }
+            if (target < 0) target = 0;
+            if (target > Length) target = Length;
             if (target != _position)
             {
                 _position = target;

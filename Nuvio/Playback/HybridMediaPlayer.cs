@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading.Tasks;
 using LibVLCSharp.Platforms.Windows;
+using Nuvio.Core;
 using Nuvio.Diagnostics;
 using Windows.Data.Json;
 using Windows.UI.Core;
@@ -50,6 +52,12 @@ namespace Nuvio.Playback
 
         private readonly HashSet<string> _primaryFailedUrls = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _bothFailedUrls = new HashSet<string>(StringComparer.Ordinal);
+        // Per-film VLC recreation gate: an open that needs a fresh LibVLC
+        // waits here until the new player publishes (epoch rise) or 5s
+        // pass. Set before the view reload is requested; completed by the
+        // MediaPlayerCreated handler in EnsureVlc.
+        private TaskCompletionSource<bool> _vlcRecreationGate;
+        private long _vlcRecreationGateEpoch;
 
         public event Action<string, JsonObject> EventRaised;
 
@@ -59,6 +67,15 @@ namespace Nuvio.Playback
         /// Raised only while the VlcPlayer layer-2 flag is on.
         /// </summary>
         public event Action<long, long> VlcVideoSurfaceReloadRequested;
+
+        /// <summary>
+        /// Raised on the UI thread when a new film opens on VLC after a
+        /// previous VLC film: the MainPage must unload and reload the
+        /// VideoView so the new LibVLC renders into a fresh swap chain.
+        /// The open waits for the re-creation (see OpenWithVlc) instead of
+        /// playing on the old chain.
+        /// </summary>
+        public event Action<long> VlcVideoSurfaceReloadForOpenRequested;
 
         public string Version { get; private set; } = "FFmpegInteropX + LibVLC";
 
@@ -119,6 +136,17 @@ namespace Nuvio.Playback
             return mode == "ffmpeg" || mode == "vlc" ? mode : "auto";
         }
 
+        /// <summary>True when VLC cannot play this request as asked: an
+        /// adaptive playlist with custom headers. VLC fetches the segments
+        /// itself and forwards only User-Agent/Referer, so the rest would
+        /// be dropped silently — FFmpeg sends them instead (6.5b).</summary>
+        private static bool NeedsAdaptiveRedirect(OpenRequest request)
+        {
+            return request != null && !string.IsNullOrEmpty(request.Url) &&
+                StreamAnalysis.IsAdaptiveUrl(request.Url) &&
+                request.Headers != null && request.Headers.Count > 0;
+        }
+
         public void Open(OpenRequest request)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(HybridMediaPlayer));
@@ -159,6 +187,17 @@ namespace Nuvio.Playback
                 // player stop), and OpenWithVlc never stops the primary — so
                 // stop it here first, mirroring the VLC stop in OpenWithPrimary.
                 try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg for a VLC open failed", ex); }
+                // 6.5b: an adaptive playlist with custom headers cannot be
+                // played by VLC at all (it forwards two headers only), so
+                // the forced engine is redirected — the stored setting and
+                // _openEngineMode stay "vlc" for the next source.
+                if (NeedsAdaptiveRedirect(request))
+                {
+                    Log.Write("Adaptive playlist with custom headers requested in VLC mode; VLC forwards only User-Agent/Referer — opening with FFmpeg instead (host " + HostOf(request.Url) + ")");
+                    RaiseEngine("FFmpegInteropX", "Playing with FFmpeg: VLC can't send this stream's headers.");
+                    OpenWithPrimary(request);
+                    return;
+                }
                 OpenWithVlc(request, _lastTimeSeconds, true);
                 return;
             }
@@ -175,6 +214,15 @@ namespace Nuvio.Playback
                 // (mirroring that branch) or both engines play at once, with
                 // the old audio hidden behind the VLC surface.
                 try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg for a VLC open failed", ex); }
+                // 6.5b: same redirect as the forced-vlc branch — VLC cannot
+                // send this playlist's headers, so retry FFmpeg instead.
+                if (NeedsAdaptiveRedirect(request))
+                {
+                    Log.Write("FFmpeg previously failed for this adaptive playlist, but VLC cannot send its headers — retrying FFmpeg (host " + HostOf(request.Url) + ")");
+                    RaiseEngine("FFmpegInteropX", "Playing with FFmpeg: VLC can't send this stream's headers.");
+                    OpenWithPrimary(request);
+                    return;
+                }
                 OpenWithVlc(request, _lastTimeSeconds, true);
                 return;
             }
@@ -211,7 +259,7 @@ namespace Nuvio.Playback
             // Mirror of the FFmpeg open log: which decoder VLC was asked for.
             // (VlcPlayer itself logs the software case again when it builds
             // its options; this line covers both modes in one place.)
-            Log.Write("VLC decoder: " + (request.HardwareDecoding ? "D3D11 hardware (hwdec=true)" : "software (hwdec=false)"));
+            Log.Write("VLC decoder requested: " + (request.HardwareDecoding ? "D3D11 hardware (hwdec=true)" : "software (hwdec=false)"));
             var vlcRequest = new OpenRequest
             {
                 Id = request.Id,
@@ -223,11 +271,97 @@ namespace Nuvio.Playback
             {
                 foreach (var header in request.Headers) vlcRequest.Headers[header.Key] = header.Value;
             }
-            if (announce)
+            // The actual open runs after the recreation gate below (fire and
+            // forget): a gate wait must never block the caller, and the
+            // announce belongs to the open that really starts, not to one
+            // the gate cancels.
+            var _ = OpenVlcAfterRecreationGateAsync(vlcRequest, request, announce);
+        }
+
+        /// <summary>Per-film VLC recreation gate: when VLC has played a
+        /// film before, the previous LibVLC/surface may be poisoned by a
+        /// stuck stop, so a new film opens on a fresh LibVLC on a fresh
+        /// swap chain. Stops the old player, asks the MainPage to reload
+        /// the VideoView, and waits up to 5s for the new player to publish
+        /// (epoch rise). The first VLC open skips the gate entirely. A
+        /// timeout cancels the open with a visible error instead of playing
+        /// on the old chain — the recovery ladder then moves to the next
+        /// source as for any other open failure.</summary>
+        private async Task OpenVlcAfterRecreationGateAsync(OpenRequest vlcRequest, OpenRequest originalRequest, bool announce)
+        {
+            try
             {
-                RaiseEngine("LibVLC", "Playing with VLC.");
+                if (_vlc != null && _vlc.HasEverPlayed)
+                {
+                    var oldEpoch = _vlc.PlayerEpoch;
+                    Log.Write("VLC player recreation requested for new open (oldEpoch=" + oldEpoch + ")");
+                    // Stop the previous film first: the worker must be idle
+                    // when the new swap-chain options arrive, or the
+                    // re-create defers to the next Stop/Open.
+                    try { _vlc.Stop(); } catch (Exception ex) { Log.Error("Stopping VLC for recreation failed", ex); }
+                    _vlc.RequestRecreationOnNextOpen();
+                    var gate = new TaskCompletionSource<bool>();
+                    _vlcRecreationGate = gate;
+                    _vlcRecreationGateEpoch = oldEpoch;
+                    try
+                    {
+                        VlcVideoSurfaceReloadForOpenRequested?.Invoke(oldEpoch);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("VLC video surface reload for open failed", ex);
+                    }
+                    var completed = await Task.WhenAny(gate.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+                    // The open may have been superseded while the gate
+                    // waited (a Stop or a newer Open replaced the request):
+                    // never resurrect it, and never report its timeout as
+                    // an error for the newer open.
+                    if (_disposed || _active != ActiveEngine.Vlc || !ReferenceEquals(_currentRequest, originalRequest)) return;
+                    if (!ReferenceEquals(completed, gate.Task) || _vlcUnavailable)
+                    {
+                        Log.Write("VLC player recreation did not complete within 5s (pending=" + (_vlcRecreationGate != null) + " epoch=" + _vlc.PlayerEpoch + ")");
+                        Log.Write("Previous player is still shutting down (open cancelled after 5s, oldEpoch=" + oldEpoch + ")");
+                        _active = ActiveEngine.None;
+                        RaiseState("error", "Previous player is still shutting down.");
+                        RaiseEnded("error", "Previous player is still shutting down.");
+                        return;
+                    }
+                    Log.Write("VLC player re-created for new open (oldEpoch=" + oldEpoch + " newEpoch=" + _vlc.PlayerEpoch + ")");
+                }
+                if (_disposed || _active != ActiveEngine.Vlc || !ReferenceEquals(_currentRequest, originalRequest)) return;
+                if (announce)
+                {
+                    RaiseEngine("LibVLC", "Playing with VLC.");
+                }
+                _vlc.Open(vlcRequest);
             }
-            _vlc.Open(vlcRequest);
+            catch (Exception ex)
+            {
+                Log.Error("VLC open after recreation gate failed", ex);
+                if (!_disposed && _active == ActiveEngine.Vlc && ReferenceEquals(_currentRequest, originalRequest))
+                {
+                    _active = ActiveEngine.None;
+                    RaiseState("error", "VLC could not play this stream.");
+                    RaiseEnded("error", "VLC could not play this stream.");
+                }
+            }
+        }
+
+        /// <summary>Decisive decoder check (diagnostic only): logs the
+        /// actual decoder of whichever engine is currently active, at a
+        /// slow-playback moment (the ViewModel's stall trip). No-op when
+        /// nothing is playing. Logs only; never changes the decoder.</summary>
+        public void LogActiveDecoder(string context)
+        {
+            try
+            {
+                if (_active == ActiveEngine.Ffmpeg && _primary != null) _primary.LogDecoder(context);
+                else if (_active == ActiveEngine.Vlc && _vlc != null) _vlc.LogDecoderState(context);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Logging the active decoder failed", ex);
+            }
         }
 
         private void EnsureVlc()
@@ -237,6 +371,15 @@ namespace Nuvio.Playback
             _vlc.EventRaised += OnVlcEvent;
             _vlc.MediaPlayerCreated += mediaPlayer =>
             {
+                // Generation guard (per-film recreation): the re-create
+                // publishes a new player asynchronously, so a stale event
+                // queued behind a newer re-create must never attach the
+                // view to the old player.
+                if (_vlc == null || !ReferenceEquals(mediaPlayer, _vlc.CurrentPlayer))
+                {
+                    Log.Write("VLC MediaPlayerCreated ignored for a stale player (expected current player)");
+                    return;
+                }
                 _vlcAttachedPlayer = mediaPlayer;
                 if (_vlcView != null) _vlcView.MediaPlayer = mediaPlayer;
                 var stop = _vlc.LastAbandonedStop;
@@ -245,6 +388,15 @@ namespace Nuvio.Playback
                 var boundToOld = abandoned != null && _vlcView != null && ReferenceEquals(_vlcView.MediaPlayer, abandoned);
                 Log.Write("VLC VideoView MediaPlayer " + (_vlcView == null ? "not attached (no view)" : "attached") +
                     " (stop=" + stop + " newEpoch=" + _vlc.PlayerEpoch + " viewBoundToNew=" + boundToNew + " viewBoundToOld=" + boundToOld + ")");
+                // Per-film recreation gate: the re-create is done once the
+                // new player publishes — complete it only for the epoch
+                // this gate waited for.
+                var gate = _vlcRecreationGate;
+                if (gate != null && _vlc.PlayerEpoch > _vlcRecreationGateEpoch)
+                {
+                    _vlcRecreationGate = null;
+                    gate.TrySetResult(true);
+                }
             };
             // Layer 1 of step 2a: detach the VideoView from a player whose
             // stop outran StopGrace. Runs on the worker when the request
@@ -528,6 +680,17 @@ namespace Nuvio.Playback
             if (_vlcUnavailable)
             {
                 EventRaised?.Invoke("player.ended", primaryEnded);
+                return;
+            }
+            // 6.5b: FFmpeg just failed this source — a VLC attempt on an
+            // adaptive playlist with custom headers would be pointless
+            // (VLC forwards only User-Agent/Referer, and the same source
+            // already failed with the engine that sends them). Warn loudly
+            // and end without a retry instead of a second silent failure.
+            if (NeedsAdaptiveRedirect(_currentRequest))
+            {
+                Log.Write("Skipping VLC fallback for adaptive playlist with custom headers (FFmpeg already failed; VLC forwards only User-Agent/Referer) — host " + HostOf(url));
+                RaiseEnded("error", GetString(primaryEnded, "message"));
                 return;
             }
             RaiseEngine("LibVLC", "FFmpeg could not play this source. Trying VLC…");

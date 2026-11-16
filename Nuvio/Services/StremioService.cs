@@ -99,9 +99,10 @@ namespace Nuvio.Services
         private const int StreamTimeoutMs = 30000;
         // S1: stream responses carry signed direct links, so a 10-minute
         // cache can hand back an expired link. Two minutes still dedupes
-        // rapid re-navigation while bounding the stale window. (Invalidating
-        // the entry when an open fails needs the player layer, not this
-        // service, so that part stays deferred.)
+        // rapid re-navigation while bounding the stale window. The player
+        // drops the entry when a link refresh starts (see
+        // StremioService.InvalidateStreams, called from PlayerViewModel),
+        // so a refresh always re-asks the addon.
         private const int StreamCacheTtlMs = 2 * 60 * 1000;
 
         private readonly LocalStore _store;
@@ -736,6 +737,20 @@ namespace Nuvio.Services
                 if (stream != null) result.Add(stream);
             }
             return result;
+        }
+
+        /// <summary>6.2a: drops one addon's cached stream list for this
+        /// video, so the next fetch re-asks the addon instead of handing
+        /// back the same (possibly expired) links. Called by the player
+        /// the moment a link refresh starts, not on every open failure —
+        /// the refresh's own fetch is the one that must miss the cache.
+        /// No-op when any argument is missing (e.g. a Handler addon has
+        /// no transport URL and no cache entry to drop).</summary>
+        public static void InvalidateStreams(string type, string id, string addonTransportUrl)
+        {
+            if (string.IsNullOrEmpty(type) || string.IsNullOrEmpty(id) || string.IsNullOrEmpty(addonTransportUrl)) return;
+            var prefix = AddonBaseUrl(addonTransportUrl) + "/stream/" + Uri.EscapeDataString(type) + "/" + Uri.EscapeDataString(id);
+            HttpService.Invalidate(prefix);
         }
 
         // ---------- Subtitles ----------

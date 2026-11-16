@@ -123,15 +123,25 @@ namespace Nuvio.Services
         public void Open(StreamItem stream, double startSeconds)
         {
             if (stream == null) throw new ArgumentNullException(nameof(stream));
+            List<string> droppedHeaders;
             var request = new OpenRequest
             {
                 Id = Guid.NewGuid().ToString("N"),
                 Url = stream.Url,
                 StartSeconds = Math.Max(0, startSeconds),
-                Headers = StreamAnalysis.StreamHeaders(stream),
+                Headers = StreamAnalysis.StreamHeaders(stream, out droppedHeaders),
                 HardwareDecoding = _settings.GetBool("hardwareDecoding", true),
                 EngineMode = _settings.PlaybackEngine,
             };
+            if (droppedHeaders.Count > 0)
+            {
+                // Names only, never values: the dropped set is the blocked
+                // list (Range, hop-by-hop, Host, Content-Length) plus
+                // empty keys/values — see StreamAnalysis.StreamHeaders.
+                Uri uri;
+                var host = Uri.TryCreate(stream.Url, UriKind.Absolute, out uri) ? uri.Host : "unknown";
+                Log.Write("Dropped unsupported request headers for host " + host + ": " + string.Join(", ", droppedHeaders));
+            }
             _currentOpenId = request.Id;
             _currentTime = request.StartSeconds;
             _duration = 0;
@@ -194,6 +204,14 @@ namespace Nuvio.Services
         {
             _aspect = string.IsNullOrEmpty(aspect) ? "fit" : aspect;
             _player.SetAspect(_aspect);
+        }
+
+        /// <summary>Decisive decoder check (diagnostic only): logs the
+        /// actual decoder of the active engine. See
+        /// HybridMediaPlayer.LogActiveDecoder.</summary>
+        public void LogActiveDecoder(string context)
+        {
+            _player.LogActiveDecoder(context);
         }
 
         public void ReportPlayback(PlaybackEventArgs args)

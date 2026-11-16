@@ -45,6 +45,9 @@ namespace Nuvio.Playback
         private bool _supportsRanges;
         private bool _aborted;
         private bool _retriedRead;
+        // 6.1b: a 416 in Seek retries from byte 0 once (see Seek). The
+        // input is created fresh per source, so no explicit reset.
+        private bool _retriedFromZeroOn416;
 
         // Read-flood guard: once the input is dead (broken or missing body
         // after a failed resume), Read returns -1 silently and only retries
@@ -295,11 +298,38 @@ namespace Nuvio.Playback
             {
                 return false;
             }
+            // 6.1a: log only — the value is NOT changed. Returning true at
+            // a clamped position would lie to the demuxer (the body is
+            // still at the old position), so an over-length seek keeps
+            // failing below exactly as before, but now with a trace.
+            if (_length > 0 && offset > _length)
+            {
+                Log.Write("VLC seek clamped: requested=" + offset + " length=" + _length + " clamped=" + _length);
+            }
             SetInputOp("Seek");
             try
             {
-                OpenAt(offset);
-                return true;
+                try
+                {
+                    OpenAt(offset);
+                    return true;
+                }
+                catch (HttpRangeNotSatisfiableException)
+                {
+                    // 6.1b: the seek target is past the server's end of the
+                    // file (stale length, or a resume past the end). Retry
+                    // once from byte 0: the demuxer asked for a position
+                    // that does not exist, so starting the body at 0 is the
+                    // only usable answer. A second 416 (or a failed retry)
+                    // falls through to the failure path below. Read-resume
+                    // deliberately never retries from 0 — Read must return
+                    // the bytes at _position.
+                    if (_retriedFromZeroOn416) throw;
+                    _retriedFromZeroOn416 = true;
+                    Log.Write("VLC seek returned HTTP 416 at " + offset + " (length=" + _length + "); retrying from byte 0 once");
+                    OpenAt(0);
+                    return true;
+                }
             }
             catch (Exception ex)
             {
@@ -385,8 +415,17 @@ namespace Nuvio.Playback
                 var response = WaitBounded(sendTask, "OpenAt", offset);
                 if (!response.IsSuccessStatusCode)
                 {
-                    var status = (int)response.StatusCode + " " + response.ReasonPhrase;
+                    // 6.1b: tell a 416 apart from any other failure before
+                    // the status text is lost: Seek retries a 416 from byte
+                    // 0 once, other statuses fail as before. The integer
+                    // comparison avoids depending on the WinRT enum member.
+                    var statusCode = (int)response.StatusCode;
+                    var status = statusCode + " " + response.ReasonPhrase;
                     response.Dispose();
+                    if (statusCode == 416)
+                    {
+                        throw new HttpRangeNotSatisfiableException((long)offset, (long)_length);
+                    }
                     throw new IOException("HTTP " + status);
                 }
 

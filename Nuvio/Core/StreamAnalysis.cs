@@ -211,16 +211,83 @@ namespace Nuvio.Core
             };
         }
 
-        /// <summary>Request headers the stream asks the player to send (behaviorHints.proxyHeaders).</summary>
-        public static Dictionary<string, string> StreamHeaders(StreamItem stream)
+        /// <summary>Request headers the stream asks the player to send (behaviorHints.proxyHeaders),
+        /// minus the blocked list (see BlockedRequestHeaders). The dropped names are
+        /// reported through <paramref name="dropped"/> (names only, never values)
+        /// so the caller can log them; StreamAnalysis stays pure and logs nothing.
+        /// Note: a future AppBridge revival would bypass this filter — it builds
+        /// OpenRequest.Headers directly (AppBridge.cs), not through here.</summary>
+        public static Dictionary<string, string> StreamHeaders(StreamItem stream, out List<string> dropped)
         {
+            dropped = new List<string>();
             var headers = new Dictionary<string, string>();
             if (stream == null || stream.BehaviorHints == null || stream.BehaviorHints.ProxyRequestHeaders == null) return headers;
             foreach (var pair in stream.BehaviorHints.ProxyRequestHeaders)
             {
-                if (pair.Value != null) headers[pair.Key] = pair.Value;
+                if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value) ||
+                    BlockedRequestHeaders.Contains(pair.Key))
+                {
+                    if (!string.IsNullOrWhiteSpace(pair.Key)) dropped.Add(SafeHeaderName(pair.Key));
+                    continue;
+                }
+                headers[pair.Key] = pair.Value;
             }
             return headers;
+        }
+
+        /// <summary>Request headers the stream asks the player to send (behaviorHints.proxyHeaders),
+        /// minus the blocked list. Prefer the overload reporting dropped names.</summary>
+        public static Dictionary<string, string> StreamHeaders(StreamItem stream)
+        {
+            List<string> dropped;
+            return StreamHeaders(stream, out dropped);
+        }
+
+        /// <summary>Headers an addon must never send on a media request: Range
+        /// (the engines manage ranges themselves) plus the hop-by-hop headers
+        /// (RFC 2616 §13.5.1) and Host/Content-Length, which the HTTP stacks
+        /// derive from the URI and the actual body. Applied once in
+        /// StreamHeaders, so all three delivery paths inherit it.</summary>
+        private static readonly HashSet<string> BlockedRequestHeaders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "Range",
+            "Connection",
+            "Keep-Alive",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade",
+            "Host",
+            "Content-Length",
+        };
+
+        // Header names come from addon data, so only a plain token-shaped
+        // name is ever reported in the dropped list; anything else is not logged.
+        private static string SafeHeaderName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "(empty)";
+            foreach (var c in name)
+            {
+                if (!(char.IsLetterOrDigit(c) || c == '-' || c == '_')) return "(invalid header name)";
+            }
+            return name;
+        }
+
+        /// <summary>True when the URL is an adaptive playlist (HLS/DASH): the
+        /// extension is .m3u8, .mpd or .m3u on the path (the query never counts).
+        /// Extension-less adaptive links (e.g. /redirect) are not detected here.</summary>
+        public static bool IsAdaptiveUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            Uri uri;
+            string path;
+            if (Uri.TryCreate(url, UriKind.Absolute, out uri)) path = uri.AbsolutePath.ToLowerInvariant();
+            else path = url.Split('?')[0].ToLowerInvariant();
+            return path.EndsWith(".m3u8", StringComparison.Ordinal) ||
+                path.EndsWith(".mpd", StringComparison.Ordinal) ||
+                path.EndsWith(".m3u", StringComparison.Ordinal);
         }
 
         /// <summary>Returns a new list; the input list is never mutated.</summary>
@@ -256,7 +323,7 @@ namespace Nuvio.Core
             double score = 0;
             var url = stream != null ? stream.Url ?? string.Empty : string.Empty;
             var path = url.Split('?')[0].ToLowerInvariant();
-            if (path.EndsWith(".m3u8", StringComparison.Ordinal) || path.EndsWith(".mpd", StringComparison.Ordinal)) score -= 1;
+            if (IsAdaptiveUrl(url)) score -= 1;
             else if (path.EndsWith(".mp4", StringComparison.Ordinal) || path.EndsWith(".m4v", StringComparison.Ordinal)) score += 0;
             else if (path.EndsWith(".mkv", StringComparison.Ordinal)) score += 3;
             else if (path.EndsWith(".webm", StringComparison.Ordinal)) score += 2;

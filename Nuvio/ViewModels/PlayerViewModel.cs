@@ -208,6 +208,13 @@ namespace Nuvio.ViewModels
         private bool _fallbackNoticeShown;
         private bool _sessionStarted;
         private StreamItem _fallbackTarget;
+        // Link-fetching recovery (6.2/6.4): one expired-link refresh in
+        // flight at a time; the URL that already spent its one same-source
+        // retry; the URL whose one refresh already ran. All three reset
+        // when an open succeeds (a later failure is a new episode).
+        private bool _refreshInFlight;
+        private string _sameSourceRetriedUrl;
+        private string _refreshedUrl;
         private NextInfo _nextInfo;
         private bool _nextDismissed;
         private double? _scrubTarget;
@@ -300,6 +307,8 @@ namespace Nuvio.ViewModels
         public Video Video { get; private set; }
         public bool IsSeries { get; private set; }
         public StreamItem Stream { get; private set; }
+        /// <summary>Debrid service (M6), set by the page from MainPage.Current.Debrid. Null until set.</summary>
+        public DebridService Debrid { get; set; }
         public List<StreamItem> Sources { get { return _sources; } }
         public bool HasMultipleSources { get { return _sources.Count > 1; } }
 
@@ -639,6 +648,21 @@ namespace Nuvio.ViewModels
             var startAt = _restart || !_settings.GetBool("resumePlayback", true)
                 ? 0
                 : _progress.ResumeSeconds(_contentId, _season, _episode);
+            // 6.1: the saved duration may be shorter than the saved
+            // position (a stale or corrupt entry), so clamp the resume
+            // point to the known duration instead of asking for a seek
+            // past the end of the file. The stream itself clamps the
+            // final seek as well — this only keeps the request honest.
+            var entry = _progress.GetProgress(_contentId, _season, _episode);
+            if (startAt > 0 && entry != null && entry.Duration > 0)
+            {
+                var limit = entry.Duration / 1000.0 - 1;
+                if (startAt > limit)
+                {
+                    Log.Write("Resume point clamped from " + startAt.ToString("F1", CultureInfo.InvariantCulture) + "s to " + Math.Max(0, limit).ToString("F1", CultureInfo.InvariantCulture) + "s (known duration " + (entry.Duration / 1000.0).ToString("F1", CultureInfo.InvariantCulture) + "s)");
+                    startAt = Math.Max(0, limit);
+                }
+            }
             if (startAt > 0)
             {
                 RequestToast(string.Format(CultureInfo.InvariantCulture,
@@ -686,6 +710,15 @@ namespace Nuvio.ViewModels
             LoadingText = S("PlayerOpeningStream", "Opening stream…");
             var info = StreamAnalysis.DescribeStream(target, target.AddonName ?? "");
             SourceLabel = JoinNonEmpty(" · ", target.AddonName, info != null ? info.Resolution : null);
+            // 6.1: never ask for a start past the known duration — a seek
+            // past the end of the file is what produced the 416s in log 36.
+            // Duration belongs to this video (a new video gets a new
+            // ViewModel), so the clamp cannot borrow another film's length.
+            if (Duration > 1 && at > Duration - 1)
+            {
+                Log.Write("Start position clamped from " + at.ToString("F1", CultureInfo.InvariantCulture) + "s to " + (Duration - 1).ToString("F1", CultureInfo.InvariantCulture) + "s (known duration " + Duration.ToString("F1", CultureInfo.InvariantCulture) + "s)");
+                at = Duration - 1;
+            }
             _lastTime = at;
             _lastTimeAt = DateTime.UtcNow;
             _lastSavedAt = DateTime.UtcNow;
@@ -811,7 +844,16 @@ namespace Nuvio.ViewModels
                 if (_failed || _closed) return;
                 StopTimer(_openTimer);
                 Ready = true;
+                // 6.7: an open that lands after failures closes the
+                // episode — say so, and clear the per-episode retry and
+                // refresh markers so a later failure starts fresh.
+                if (_consecutiveFailures > 0)
+                {
+                    Log.Write("Recovery: open succeeded after " + _consecutiveFailures + " consecutive failure(s)");
+                }
                 _consecutiveFailures = 0;
+                _sameSourceRetriedUrl = null;
+                _refreshedUrl = null;
                 // Stall counter is NOT reset here: OnPlayerReady fires for a
                 // stall reconnect too, and resetting it made every stall
                 // look like the first one forever (log 37: two reconnects
@@ -914,7 +956,8 @@ namespace Nuvio.ViewModels
             StopTimer(_openTimer);
             if (_closed || Ready || _failed) return;
             TryNextSource(S("PlayerNoResponse",
-                "The player did not respond. Check the stream link or network, then retry or choose another source."));
+                "The player did not respond. Check the stream link or network, then retry or choose another source."),
+                failureKind: "timeout");
         }
 
         private void OnFallbackTimerTick(object sender, object e)
@@ -977,6 +1020,12 @@ namespace Nuvio.ViewModels
             _stallHealthyMs = 0;
             if (_stallSlowMs < StallTimeoutMs) return;
             _stallSlowMs = 0;
+            // Decisive decoder check: snapshot the actual decoder at the
+            // stall moment, so a mid-film switch shows in the next log.
+            // (FFmpeg's own SLOW line already carries one; this is the
+            // stall detector's own snapshot — the only one VLC ever gets,
+            // since VLC has no slow-rate logging of its own.)
+            _player.LogActiveDecoder("stall");
             if (_stallReconnects < 1)
             {
                 _stallReconnects++;
@@ -987,13 +1036,24 @@ namespace Nuvio.ViewModels
             }
             else
             {
-                TryNextSource(S("PlayerStalledTryNext", "The stream stalled. Trying the next available source."));
+                // The stall already reconnected once: a same-source retry
+                // here would be a third attempt at a stalling link.
+                TryNextSource(S("PlayerStalledTryNext", "The stream stalled. Trying the next available source."),
+                    allowSameSourceRetry: false, failureKind: "stall");
             }
         }
 
-        private void TryNextSource(string reason)
+        /// <summary>Recovery ladder (6.2/6.4/6.7): one entry point for every
+        /// open failure. The counter increments once here and only here, so
+        /// every step below consumes one of the 3 slots. Order: refresh an
+        /// expired signed link first (retrying the dead link itself would
+        /// be pointless), then one retry of the same source for a transient
+        /// failure, then the next source. A stall failure skips the retry —
+        /// the stall already reconnected once.</summary>
+        private void TryNextSource(string reason, bool allowSameSourceRetry = true, string failureKind = "ended")
         {
             if (_closed || _failed) return;
+            Log.Write("Recovery: TryNextSource (" + failureKind + ") failures=" + _consecutiveFailures + " host=" + HostOf(Stream != null ? Stream.Url : null));
             _consecutiveFailures++;
             if (_consecutiveFailures >= MaxConsecutiveFailures)
             {
@@ -1003,6 +1063,35 @@ namespace Nuvio.ViewModels
                         S("PlayerTriedSources", "Tried {0} sources without success."), _consecutiveFailures));
                 return;
             }
+            if (TryStartLinkRefresh()) return;
+            if (allowSameSourceRetry && TryStartSameSourceRetry()) return;
+            ScheduleNextSource(reason);
+        }
+
+        /// <summary>6.4: schedules one retry of the same source after the
+        /// normal 1.5s fallback delay, reusing the fallback timer. Returns
+        /// false when the retry does not apply (no current source, or this
+        /// URL already spent its one retry). The stall counter is preserved
+        /// across the retry (see OnFallbackTimerTick → Start).</summary>
+        private bool TryStartSameSourceRetry()
+        {
+            var current = Stream;
+            if (current == null || string.IsNullOrEmpty(current.Url)) return false;
+            if (string.Equals(_sameSourceRetriedUrl, current.Url, StringComparison.Ordinal)) return false;
+            _sameSourceRetriedUrl = current.Url;
+            _stallReconnectPending = true;
+            Log.Write("Recovery: retrying same source once in " + FallbackDelayMs + "ms (host " + HostOf(current.Url) + ")");
+            _fallbackTarget = current;
+            _fallbackTimer.Interval = TimeSpan.FromMilliseconds(FallbackDelayMs);
+            _fallbackTimer.Start();
+            return true;
+        }
+
+        /// <summary>Tail of TryNextSource: moves to the next playable
+        /// source after the current one. Used directly by the refresh
+        /// failure path — no second counter increment.</summary>
+        private void ScheduleNextSource(string reason)
+        {
             var currentIndex = _playbackSources.FindIndex(s => s.Url == Stream.Url);
             var next = _playbackSources.Skip(currentIndex + 1).FirstOrDefault(s => StreamAnalysis.IsPlayable(s));
             if (next == null)
@@ -1019,13 +1108,231 @@ namespace Nuvio.ViewModels
                 _fallbackNoticeShown = true;
                 RequestToast(S("PlayerSourceFailed", "This source failed. Trying the next available source."));
             }
+            Log.Write("Recovery: moving to next source (host " + HostOf(next.Url) + ")");
+            // A different source is a fresh stall context: the retry's
+            // preserved counter must not leak into it.
+            _stallReconnectPending = false;
             _fallbackTarget = next;
             _fallbackTimer.Interval = TimeSpan.FromMilliseconds(FallbackDelayMs);
             _fallbackTimer.Start();
         }
 
+        /// <summary>6.2b: starts one expired-link refresh for the current
+        /// source. Returns true when the refresh owns the outcome (started,
+        /// or one is already in flight) — the caller must not schedule
+        /// anything else. Returns false when no refresh applies (no signed
+        /// link, or this URL already refreshed once).</summary>
+        private bool TryStartLinkRefresh()
+        {
+            var current = Stream;
+            if (current == null || string.IsNullOrEmpty(current.Url)) return false;
+            if (!UrlLooksCredentialed(current.Url)) return false;
+            if (string.Equals(_refreshedUrl, current.Url, StringComparison.Ordinal)) return false;
+            if (_refreshInFlight) return true;
+            _refreshInFlight = true;
+            _refreshedUrl = current.Url;
+            Log.Write("Recovery: refreshing expired link (host " + HostOf(current.Url) + ")");
+            var _ = RefreshExpiredLinkAsync(current, Ready ? CurrentTime() : _lastTime);
+            return true;
+        }
+
+        /// <summary>6.2b: drops the addon's cached stream list, re-fetches
+        /// it, matches the same result, and re-opens it from the saved
+        /// position. Any failure — no addon, no match, a torrent that
+        /// cannot be re-resolved — falls through to the next source
+        /// without consuming another counter slot.</summary>
+        private async Task RefreshExpiredLinkAsync(StreamItem failed, double resumeAt)
+        {
+            try
+            {
+                // 6.2a: drop the cached list first, so the fetch below
+                // re-asks the addon instead of returning the same expired
+                // links. (A Handler addon has no transport URL and no cache
+                // entry; InvalidateStreams no-ops for it.)
+                StremioService.InvalidateStreams(Meta.Type, _videoId, failed.AddonUrl);
+                Log.Write("Recovery: stream cache invalidated for the failed source's addon");
+                var addon = _stremio.EnabledAddons().FirstOrDefault(a => a.TransportUrl == failed.AddonUrl);
+                if (addon == null)
+                {
+                    Log.Write("Recovery: link refresh found no addon for the failed source; moving to next source");
+                    Dispatch(() => { if (!_closed) ScheduleNextSource(null); });
+                    return;
+                }
+                var fresh = await _stremio.FetchStreamsAsync(addon, Meta.Type, _videoId).ConfigureAwait(false);
+                if (_closed) return;
+                var match = fresh != null ? fresh.FirstOrDefault(s => MatchesRefreshed(s, failed)) : null;
+                if (match == null)
+                {
+                    Log.Write("Recovery: link refresh found no matching source; moving to next source");
+                    Dispatch(() => { if (!_closed) ScheduleNextSource(null); });
+                    return;
+                }
+                // A torrent result must be re-resolved against the provider
+                // (the cached direct link just failed); a direct link is
+                // used as returned. Only when a debrid account is connected
+                // — without one, a torrent match cannot be played.
+                if (!string.IsNullOrEmpty(match.InfoHash))
+                {
+                    var resolved = await TryResolveRefreshedTorrentAsync(match).ConfigureAwait(false);
+                    if (_closed) return;
+                    if (resolved == null)
+                    {
+                        Log.Write("Recovery: link refresh could not re-resolve the torrent; moving to next source");
+                        Dispatch(() => { if (!_closed) ScheduleNextSource(null); });
+                        return;
+                    }
+                    match = resolved;
+                }
+                Log.Write("Recovery: link refreshed (host " + HostOf(match.Url) + "); resuming at " + resumeAt.ToString("F1", CultureInfo.InvariantCulture) + "s");
+                var refreshed = match;
+                Dispatch(() =>
+                {
+                    if (_closed) return;
+                    ReplaceSourceInPlace(failed, refreshed);
+                    // Same source re-opened: keep the stall counter, as
+                    // the same-source retry does.
+                    _stallReconnectPending = true;
+                    Start(refreshed, resumeAt);
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Link refresh failed", ex);
+                Dispatch(() => { if (!_closed) ScheduleNextSource(null); });
+            }
+            finally
+            {
+                _refreshInFlight = false;
+            }
+        }
+
+        /// <summary>6.2b: does a freshly fetched result describe the same
+        /// source that just failed? Torrents match on infoHash+fileIdx
+        /// (playability is not required — the match may need re-resolving);
+        /// direct links match on the stable filename, then binge group+name.</summary>
+        private static bool MatchesRefreshed(StreamItem candidate, StreamItem failed)
+        {
+            if (candidate == null || failed == null) return false;
+            if (!string.IsNullOrEmpty(failed.InfoHash) || !string.IsNullOrEmpty(candidate.InfoHash))
+            {
+                return string.Equals(candidate.InfoHash, failed.InfoHash, StringComparison.Ordinal) &&
+                    candidate.FileIdx == failed.FileIdx;
+            }
+            if (!StreamAnalysis.IsPlayable(candidate)) return false;
+            var candidateFilename = candidate.BehaviorHints != null ? candidate.BehaviorHints.Filename : null;
+            var failedFilename = failed.BehaviorHints != null ? failed.BehaviorHints.Filename : null;
+            if (!string.IsNullOrEmpty(candidateFilename) && !string.IsNullOrEmpty(failedFilename))
+            {
+                return string.Equals(candidateFilename, failedFilename, StringComparison.Ordinal);
+            }
+            var candidateGroup = candidate.BehaviorHints != null ? candidate.BehaviorHints.BingeGroup : null;
+            var failedGroup = failed.BehaviorHints != null ? failed.BehaviorHints.BingeGroup : null;
+            return !string.IsNullOrEmpty(candidateGroup) && string.Equals(candidateGroup, failedGroup, StringComparison.Ordinal) &&
+                string.Equals(candidate.Name, failed.Name, StringComparison.Ordinal);
+        }
+
+        /// <summary>6.2b: re-resolves a refreshed torrent result without
+        /// touching the debrid cache. Returns null when no debrid service
+        /// is attached or the resolve fails — the caller moves on.</summary>
+        private async Task<StreamItem> TryResolveRefreshedTorrentAsync(StreamItem torrent)
+        {
+            var debrid = Debrid;
+            if (debrid == null) return null;
+            try
+            {
+                var resolved = await debrid.ResolveTorrentFreshAsync(torrent, _season, _episode).ConfigureAwait(false);
+                if (resolved == null || string.IsNullOrEmpty(resolved.Url)) return null;
+                return CopyStreamItem(torrent, resolved);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Re-resolving refreshed torrent failed", ex);
+                return null;
+            }
+        }
+
+        /// <summary>Builds the playable item for a re-resolved torrent:
+        /// the torrent's identity and headers, the fresh direct link, the
+        /// resolved name, and the resolved size. The hints are cloned
+        /// first so the shared instance is never mutated.</summary>
+        private static StreamItem CopyStreamItem(StreamItem torrent, DebridResolved resolved)
+        {
+            var hints = torrent.BehaviorHints != null
+                ? new StreamBehaviorHints
+                {
+                    Filename = torrent.BehaviorHints.Filename,
+                    VideoSize = resolved.Size ?? torrent.BehaviorHints.VideoSize,
+                    VideoHash = torrent.BehaviorHints.VideoHash,
+                    BingeGroup = torrent.BehaviorHints.BingeGroup,
+                    ProxyRequestHeaders = torrent.BehaviorHints.ProxyRequestHeaders,
+                }
+                : (resolved.Size.HasValue ? new StreamBehaviorHints { VideoSize = resolved.Size } : null);
+            return new StreamItem
+            {
+                Url = resolved.Url,
+                Name = !string.IsNullOrEmpty(resolved.Filename) ? resolved.Filename : torrent.Name,
+                Title = torrent.Title,
+                Description = torrent.Description,
+                InfoHash = torrent.InfoHash,
+                FileIdx = torrent.FileIdx,
+                Sources = torrent.Sources,
+                YtId = torrent.YtId,
+                ExternalUrl = torrent.ExternalUrl,
+                Subtitles = torrent.Subtitles,
+                BehaviorHints = hints,
+                Jellyfin = torrent.Jellyfin,
+                AddonUrl = torrent.AddonUrl,
+                AddonName = torrent.AddonName,
+            };
+        }
+
+        /// <summary>6.2b: swaps the failed source for its refreshed twin
+        /// at the same position in both lists — TryNextSource matches by
+        /// URL, so appending instead would break its FindIndex.</summary>
+        private void ReplaceSourceInPlace(StreamItem failed, StreamItem refreshed)
+        {
+            var playbackIndex = _playbackSources.FindIndex(s => s.Url == failed.Url);
+            if (playbackIndex >= 0) _playbackSources[playbackIndex] = refreshed;
+            var index = _sources.FindIndex(s => s.Url == failed.Url);
+            if (index >= 0) _sources[index] = refreshed;
+            if (Stream == failed) Stream = refreshed;
+        }
+
+        /// <summary>6.2b: a shape check on query key names only (never
+        /// values): expiry/signature/token/auth keys suggest a signed link
+        /// that can expire — and can therefore be refreshed.</summary>
+        private static bool UrlLooksCredentialed(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            var queryIndex = url.IndexOf('?');
+            if (queryIndex < 0 || queryIndex == url.Length - 1) return false;
+            var query = url.Substring(queryIndex + 1);
+            var fragmentIndex = query.IndexOf('#');
+            if (fragmentIndex >= 0) query = query.Substring(0, fragmentIndex);
+            var keys = new[] { "expires", "exp", "signature", "sig", "token", "auth", "x-amz-signature", "policy", "key-pair-id" };
+            foreach (var pair in query.Split('&'))
+            {
+                var equals = pair.IndexOf('=');
+                var key = (equals >= 0 ? pair.Substring(0, equals) : pair).Trim().ToLowerInvariant();
+                foreach (var credentialed in keys)
+                {
+                    if (key == credentialed) return true;
+                }
+            }
+            return false;
+        }
+
+        // Host only, never the path or query: stream URLs may carry tokens.
+        private static string HostOf(string url)
+        {
+            Uri uri;
+            return url != null && Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.Host : "unknown";
+        }
+
         private void ShowError(string message)
         {
+            // 6.7: the terminal step of the ladder — the count that ended it.
+            Log.Write("Recovery: giving up after " + _consecutiveFailures + " consecutive failure(s)");
             _failed = true;
             StopTimer(_openTimer);
             StopTimer(_fallbackTimer);
@@ -2000,6 +2307,9 @@ namespace Nuvio.ViewModels
         {
             if (_closed) return;
             _closed = true;
+            _refreshInFlight = false;
+            _sameSourceRetriedUrl = null;
+            _refreshedUrl = null;
             Save(true);
             Report("stop");
             StopTimer(_openTimer);

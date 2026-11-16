@@ -113,6 +113,17 @@ namespace Nuvio.Playback
         // are awaited: ApplySwapChainOptionsOnWorker routes them to the
         // layer-2 re-create instead of the idle-only MaybeRecreate.
         private bool _surfaceReplacementPending;
+        // Per-film recreation: set when a new film opens on VLC (see
+        // RequestRecreationOnNextOpen). The next swap-chain options
+        // arrival routes to the same layer-2 re-create — but this flag is
+        // a plain open decision, not gated by ReplaceSurfaceOnAbandonedStop
+        // (which stays false): every new film gets a fresh LibVLC on a
+        // fresh swap chain, so a poisoned surface never outlives its film.
+        private bool _recreateOnNextOpen;
+        // True once VLC has played any film in this app lifetime (sticky:
+        // the first VLC open skips the recreation gate — there is no
+        // previous surface to escape from).
+        private bool _everPlayed;
         // LibVLC instance parked for the stop thread: the layer-2 re-create
         // must not dispose the instance while its stop still owns the
         // player, so RunStop's finally disposes it when Stop() returns.
@@ -137,6 +148,13 @@ namespace Nuvio.Playback
         // Last VoutCount seen on the worker; the UI-thread stats line reads
         // this field instead of calling LibVLC off the worker.
         private int _voutCount;
+        // Decisive decoder check: the last decoder/vout module seen on
+        // the libvlc log channel (d3d11va = hardware path, avcodec = the
+        // decoder wrapper, direct3d11 = the video output). LibVLCSharp
+        // exposes no hardware-decoder flag, so this — the video codec and
+        // the live vout count — is the closest live proxy. Reset on every
+        // LibVLC re-create; the sighting belongs to that instance only.
+        private string _lastDecoderModule;
 
         // UI thread state.
         private long _loadSeq;
@@ -235,6 +253,26 @@ namespace Nuvio.Playback
         internal long PlayerEpoch
         {
             get { return Interlocked.Read(ref _playerEpoch); }
+        }
+
+        /// <summary>True once VLC has played any film in this app lifetime.</summary>
+        internal bool HasEverPlayed
+        {
+            get { return _everPlayed; }
+        }
+
+        /// <summary>The live MediaPlayer, for the hybrid player's attach guard.</summary>
+        internal MediaPlayer CurrentPlayer
+        {
+            get { return _mediaPlayer; }
+        }
+
+        /// <summary>Asks the next swap-chain options arrival to re-create
+        /// LibVLC on the fresh chain (per-film recreation). Set by the
+        /// hybrid player before it reloads the VideoView for a new open.</summary>
+        internal void RequestRecreationOnNextOpen()
+        {
+            _recreateOnNextOpen = true;
         }
 
         /// <summary>Stop that last abandoned a player (-1 when none).</summary>
@@ -360,8 +398,12 @@ namespace Nuvio.Playback
                 Log.Write("LibVLC swap-chain options arrived while VLC is playing; keeping them for the next start");
                 return;
             }
-            if (_surfaceReplacementPending)
+            if (_surfaceReplacementPending || _recreateOnNextOpen)
             {
+                // Either pending trigger routes to the same layer-2
+                // re-create; the flag is consumed here so a deferred run
+                // (not ready / still playing) keeps it for the next attempt.
+                _recreateOnNextOpen = false;
                 RecreateLibVlcWithSwapChainOptions();
                 return;
             }
@@ -540,6 +582,10 @@ namespace Nuvio.Playback
             Interlocked.Exchange(ref _vlcLogLines, 0);
             Interlocked.Exchange(ref _vlcLogSuppressed, 0);
             CreateLibVlc(stored);
+            // The vout count belongs to the old instance: zero it so the
+            // stats lines of the new film do not read the old film's value
+            // until the first OnVideoOutput of the new instance.
+            _voutCount = 0;
             if (_mediaPlayer != null)
             {
                 Interlocked.Exchange(ref _surfaceReplacementDoneEpoch, epochAtStart);
@@ -585,6 +631,9 @@ namespace Nuvio.Playback
                 _libVlc = new LibVLC(false, options.ToArray());
 #endif
                 _mediaPlayer = new MediaPlayer(_libVlc);
+                // Fresh LibVLC instance: the old instance's decoder-module
+                // sightings do not carry over (see _lastDecoderModule).
+                _lastDecoderModule = null;
                 Interlocked.Increment(ref _playerEpoch);
                 Subscribe(_mediaPlayer);
                 _libVlc.Log += OnLibVlcLog;
@@ -1115,6 +1164,23 @@ namespace Nuvio.Playback
             }
             else
             {
+                // 6.5b: VLC fetches adaptive playlists itself and forwards
+                // only User-Agent/Referer — every other requested header is
+                // dropped silently by LibVLC 3. Say so (names only, never
+                // values) instead of leaving a silent authentication gap.
+                var dropped = new List<string>();
+                foreach (var header in _request.Headers)
+                {
+                    if (string.IsNullOrWhiteSpace(header.Key)) continue;
+                    if (header.Key.Equals("Range", StringComparison.OrdinalIgnoreCase) ||
+                        header.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase) ||
+                        header.Key.Equals("Referer", StringComparison.OrdinalIgnoreCase)) continue;
+                    dropped.Add(header.Key);
+                }
+                if (dropped.Count > 0)
+                {
+                    Log.Write("VLC adaptive playlist (host=" + HostOf(_request.Url) + "): VLC fetches segments itself; dropping " + dropped.Count + " header(s) except User-Agent/Referer: " + string.Join(", ", dropped));
+                }
                 string value;
                 if (_request.Headers.TryGetValue("User-Agent", out value))
                 {
@@ -1652,6 +1718,13 @@ namespace Nuvio.Playback
             return true;
         }
 
+        // Host only, never the path or query: stream URLs may carry tokens.
+        private static string HostOf(string url)
+        {
+            Uri uri;
+            return url != null && Uri.TryCreate(url, UriKind.Absolute, out uri) ? uri.Host : "unknown";
+        }
+
         // Plain files go through Windows' HTTP stack. HLS and DASH playlists need VLC to fetch the
         // segments itself, so they stay on VLC's own HTTP code.
         private static bool UseWindowsHttp(string url)
@@ -1673,6 +1746,16 @@ namespace Nuvio.Playback
         {
             try
             {
+                // Decisive decoder check: remember the last decoder/vout
+                // module seen, before the level filter below drops most
+                // of these lines (d3d11va/avcodec/direct3d11 mostly log
+                // below Warning). A later sighting means the decoder was
+                // (re)created after the open — a mid-film switch leaves
+                // exactly this trace.
+                if (e.Module == "d3d11va" || e.Module == "avcodec" || e.Module == "direct3d11")
+                {
+                    _lastDecoderModule = e.Module;
+                }
                 if (e.Level < LogLevel.Warning)
                 {
                     return;
@@ -1696,6 +1779,56 @@ namespace Nuvio.Playback
             catch
             {
                 // Never let logging break VLC's thread.
+            }
+        }
+
+        /// <summary>Decisive decoder check (diagnostic only): logs what VLC
+        /// is actually doing at a slow-playback moment. LibVLCSharp exposes
+        /// NO hardware-decoder flag, so this logs the live facts instead:
+        /// the video track's codec, the decoded size, the live vout count,
+        /// and the last decoder/vout module seen on the libvlc channel.
+        /// "requested" is what the open asked for — never a measurement.
+        /// Never throws: any unreadable player logs its exception type.</summary>
+        internal void LogDecoderState(string context)
+        {
+            try
+            {
+                string codec = null;
+                var player = _mediaPlayer;
+                if (player != null)
+                {
+                    using (var media = player.Media)
+                    {
+                        var tracks = media != null ? media.Tracks : null;
+                        if (tracks != null)
+                        {
+                            foreach (var track in tracks)
+                            {
+                                if (track.TrackType == TrackType.Video)
+                                {
+                                    codec = FourCcToString(track.Codec);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                uint width = 0;
+                uint height = 0;
+                var vout = -1;
+                if (player != null)
+                {
+                    try { player.Size(0, ref width, ref height); } catch { }
+                    try { vout = (int)player.VoutCount; } catch { }
+                }
+                Log.Write("VLC decoder (" + context + "): codec=" + (codec ?? "?") +
+                    " size=" + width + "x" + height + " vout=" + vout +
+                    " lastModule=" + (_lastDecoderModule ?? "?") +
+                    " hwDecoder=not-exposed-by-LibVLCSharp (requested=" + (_request != null && _request.HardwareDecoding ? "D3D11 hardware" : "software") + ")");
+            }
+            catch (Exception ex)
+            {
+                Log.Write("VLC decoder (" + context + "): could not read decoder info: " + ex.GetType().Name);
             }
         }
 
@@ -1769,6 +1902,7 @@ namespace Nuvio.Playback
         private void OnPlaying(long seq)
         {
             _hasPlayed = true;
+            _everPlayed = true;
             if (!_inputStarted)
             {
                 _inputStarted = true;

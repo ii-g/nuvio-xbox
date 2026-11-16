@@ -251,6 +251,24 @@ namespace Nuvio.Services
                     return hit.Result;
                 }
             }
+            var result = await ResolveTorrentFreshAsync(stream, season, episode).ConfigureAwait(false);
+            lock (_cacheSync)
+            {
+                _cache[key] = new CacheEntry { At = DateTimeOffset.UtcNow, Result = result };
+            }
+            return result;
+        }
+
+        /// <summary>Resolves a torrent result to a playable link without
+        /// touching the cache at all (no read, no write). Used by the
+        /// expired-link refresh (6.2b): the refresh must re-ask the
+        /// provider, never serve the cached link that just failed.
+        /// Throws DebridError (missing | invalid_key | error).</summary>
+        public async Task<DebridResolved> ResolveTorrentFreshAsync(StreamItem stream, int? season, int? episode)
+        {
+            var account = DebridAccount();
+            if (account == null) throw new DebridError("missing", "Connect a debrid service in Settings to play torrent results.");
+            var fileIdx = stream != null ? stream.FileIdx : null;
             var magnet = MagnetFor(stream);
             if (magnet == null) throw new DebridError("error", "This result has no torrent to resolve.");
             var want = new FileWant
@@ -261,15 +279,9 @@ namespace Nuvio.Services
                 Episode = episode,
             };
             var apiKey = account.ApiKey.Trim();
-            DebridResolved result;
-            if (account.Provider == "torbox") result = await ResolveTorboxAsync(apiKey, magnet, want).ConfigureAwait(false);
-            else if (account.Provider == "realdebrid") result = await ResolveRealDebridAsync(apiKey, magnet, want).ConfigureAwait(false);
-            else result = await ResolvePremiumizeAsync(apiKey, magnet, want).ConfigureAwait(false);
-            lock (_cacheSync)
-            {
-                _cache[key] = new CacheEntry { At = DateTimeOffset.UtcNow, Result = result };
-            }
-            return result;
+            if (account.Provider == "torbox") return await ResolveTorboxAsync(apiKey, magnet, want).ConfigureAwait(false);
+            if (account.Provider == "realdebrid") return await ResolveRealDebridAsync(apiKey, magnet, want).ConfigureAwait(false);
+            return await ResolvePremiumizeAsync(apiKey, magnet, want).ConfigureAwait(false);
         }
 
         /// <summary>True only when the cached link is definitively rejected

@@ -6,6 +6,7 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using System.Threading;
 using System.Threading.Tasks;
 using FFmpegInteropX;
+using Nuvio.Core;
 using Nuvio.Diagnostics;
 using Windows.Data.Json;
 using Windows.Media.Core;
@@ -46,6 +47,10 @@ namespace Nuvio.Playback
         private string _lastErrorKind; // e.g. DecodingError, SourceNotSupported, NetworkError
         private bool _disposed;
         private long _openGeneration;
+        // 6.1b: generation whose 416 retry already ran (-1 when none). A
+        // retry reopens the same source from byte 0 inside the same
+        // generation, so the guard is per generation, not per open.
+        private long _retriedFromZero416Generation = -1;
         private long _lastPositionEventTicks;
         private long _lastHeartbeatTicks;
         private long _positionChangedSinceHeartbeat;
@@ -303,8 +308,7 @@ namespace Nuvio.Playback
             try
             {
                 var hasHeaders = request.Headers != null && request.Headers.Count > 0;
-                var path = uri.AbsolutePath.ToLowerInvariant();
-                var adaptive = path.EndsWith(".m3u8") || path.EndsWith(".mpd") || path.EndsWith(".m3u");
+                var adaptive = StreamAnalysis.IsAdaptiveUrl(uri.AbsoluteUri);
                 // Diagnostic only: header names, host and path — never header
                 // values or the query string, which may carry tokens.
                 Log.Write("Opening FFmpeg media: adaptive=" + adaptive +
@@ -363,6 +367,32 @@ namespace Nuvio.Playback
             }
             catch (Exception ex)
             {
+                // 6.1b: a 416 means the requested start is past the server's
+                // end of the file (stale length, or a resume past the end).
+                // Reopen the same source from byte 0 once, inside this
+                // generation and with the same token — never through Open(),
+                // which would raise the generation, cancel this token and
+                // forget the retry ever happened. Only the first 416 per
+                // generation retries; the stream throws only its first 416
+                // anyway, and the guard below covers a wrapped repeat.
+                HttpRangeNotSatisfiableException rangeError;
+                if (TryFindRangeNotSatisfiable(ex, out rangeError) &&
+                    generation != _retriedFromZero416Generation && IsCurrentOpen(generation, token))
+                {
+                    _retriedFromZero416Generation = generation;
+                    Log.Write("FFmpeg source returned HTTP 416; reopening the same source from byte 0 once (attempt 2/2, host=" + uri.Host + ")");
+                    var retryRequest = new OpenRequest
+                    {
+                        Id = request.Id,
+                        Url = request.Url,
+                        StartSeconds = 0,
+                        Headers = request.Headers,
+                        HardwareDecoding = request.HardwareDecoding,
+                        EngineMode = request.EngineMode,
+                    };
+                    await OpenSourceAsync(retryRequest, uri, generation, token);
+                    return;
+                }
                 // Messages are included URL-redacted (see DescribeOpenException).
                 // The hwdec flag matters here: a failure while hardware decoding
                 // was requested may be a D3D11VA failure, not a bad source.
@@ -575,6 +605,41 @@ namespace Nuvio.Playback
                 generation == Interlocked.Read(ref _openGeneration) && !_openFailed;
         }
 
+        /// <summary>Finds a 416 from the stream anywhere in the exception
+        /// chain: FFmpegInteropX may surface a stream failure wrapped
+        /// (COM/Aggregate), so the type is searched, not just caught.</summary>
+        private static bool TryFindRangeNotSatisfiable(Exception ex, out HttpRangeNotSatisfiableException found)
+        {
+            found = null;
+            var current = ex;
+            var depth = 0;
+            while (current != null && depth < 5)
+            {
+                var match = current as HttpRangeNotSatisfiableException;
+                if (match != null)
+                {
+                    found = match;
+                    return true;
+                }
+                var aggregate = current as AggregateException;
+                if (aggregate != null)
+                {
+                    foreach (var inner in aggregate.InnerExceptions)
+                    {
+                        HttpRangeNotSatisfiableException nested;
+                        if (TryFindRangeNotSatisfiable(inner, out nested))
+                        {
+                            found = nested;
+                            return true;
+                        }
+                    }
+                }
+                current = current.InnerException;
+                depth++;
+            }
+            return false;
+        }
+
         private void FailOpen(long generation, string message, string errorKind)
         {
             if (generation != Interlocked.Read(ref _openGeneration) || _disposed || _openFailed) return;
@@ -691,6 +756,15 @@ namespace Nuvio.Playback
             {
                 Log.Write("FFmpeg decoder (" + context + "): could not read decoder info: " + ex.GetType().Name);
             }
+        }
+
+        /// <summary>Decisive decoder check (diagnostic only): public entry
+        /// point for LogActualDecoder, so the stall detector in the
+        /// ViewModel can snapshot the actual decoder at the stall moment
+        /// through the player layers. Logs only; never changes the decoder.</summary>
+        public void LogDecoder(string context)
+        {
+            LogActualDecoder(context);
         }
 
         // Diagnostic for the 0x0-size opens (log 35): at confirmation
@@ -1535,6 +1609,10 @@ namespace Nuvio.Playback
                 {
                     _slowRateLogged = true;
                     Log.Write("FFmpeg SLOW PLAYBACK RATE: rate=" + rate.ToString("F3", CultureInfo.InvariantCulture) + "x pos=" + positionSeconds.ToString("F1", CultureInfo.InvariantCulture) + "s src=" + source + " pageId=" + (_pageId ?? "n/a"));
+                    // Decisive decoder check: the actual decoder at the
+                    // slow moment — a switch to software mid-film shows
+                    // in the next log, next to the SLOW line itself.
+                    LogActualDecoder("slow-rate");
                     TrySlowRateKick(rate);
                 }
             }

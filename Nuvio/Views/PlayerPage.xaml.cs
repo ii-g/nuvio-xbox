@@ -52,6 +52,7 @@ namespace Nuvio.Views
             InitializeComponent();
             var shell = MainPage.Current;
             _viewModel = new PlayerViewModel(shell.PlayerService, shell.Stremio, shell.Progress, shell.Settings, shell.Navigation);
+            _viewModel.Debrid = shell.Debrid;
             DataContext = _viewModel;
             _viewModel.PropertyChanged += OnViewModelPropertyChanged;
             _viewModel.ToastRequested += OnToastRequested;

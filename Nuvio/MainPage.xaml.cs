@@ -150,6 +150,7 @@ namespace Nuvio
             SetFlowDirection(AppSettings.EffectiveIsRightToLeft());
             _player = new HybridMediaPlayer();
             _player.VlcVideoSurfaceReloadRequested += ReloadVlcVideoView;
+            _player.VlcVideoSurfaceReloadForOpenRequested += ReloadVlcVideoViewForOpen;
             // The page has its own focus navigation for the controller; the console's mouse-mode
             // cursor would only get in the way.
             SetPointerMode(false);
@@ -634,6 +635,8 @@ namespace Nuvio
         // VideoView — Unloaded destroys its swap chain inside LibVLCSharp —
         // and reload it, so the next LibVLC instance renders into a fresh
         // chain instead of the one the abandoned vout still references.
+        // The same core also serves per-film recreation (reason="open"):
+        // a new film opens on a fresh chain before the open proceeds.
         // Runs on the UI thread (raised through the hybrid player's
         // dispatcher). If the unload itself fails, layer 2 stops here:
         // the old view is left in place and the failure is logged, so
@@ -644,7 +647,22 @@ namespace Nuvio
         // message instead of playing on a destroyed view.
         private void ReloadVlcVideoView(long stopSeq, long epoch)
         {
-            Log.Write("VLC video surface unload requested (stop=" + stopSeq + " epoch=" + epoch + ")");
+            ReloadVlcVideoViewCore("abandoned-stop", stopSeq, epoch);
+        }
+
+        // Per-film recreation: a new film opens on VLC, so the view is
+        // reloaded for a fresh swap chain before the open proceeds. The
+        // open waits on its gate (see HybridMediaPlayer) for the new
+        // LibVLC to publish after the new Initialized event delivers its
+        // swap-chain options.
+        private void ReloadVlcVideoViewForOpen(long epoch)
+        {
+            ReloadVlcVideoViewCore("open", -1, epoch);
+        }
+
+        private void ReloadVlcVideoViewCore(string reason, long stopSeq, long epoch)
+        {
+            Log.Write("VLC video surface unload requested (reason=" + reason + " stop=" + stopSeq + " epoch=" + epoch + ")");
             var started = DateTime.UtcNow;
             try
             {
@@ -656,7 +674,7 @@ namespace Nuvio
                 return;
             }
             var unloadTook = (long)(DateTime.UtcNow - started).TotalMilliseconds;
-            Log.Write("VLC video surface unloaded (stop=" + stopSeq + " epoch=" + epoch + " took=" + unloadTook + "ms)");
+            Log.Write("VLC video surface unloaded (reason=" + reason + " stop=" + stopSeq + " epoch=" + epoch + " took=" + unloadTook + "ms)");
             VideoView reloaded;
             try
             {
@@ -672,7 +690,7 @@ namespace Nuvio
                 try
                 {
                     reloaded = CreateVlcVideoView();
-                    Log.Write("VLC video surface reloaded after retry (stop=" + stopSeq + " epoch=" + epoch + " took=" + (long)(DateTime.UtcNow - started).TotalMilliseconds + "ms)");
+                    Log.Write("VLC video surface reloaded after retry (reason=" + reason + " stop=" + stopSeq + " epoch=" + epoch + " took=" + (long)(DateTime.UtcNow - started).TotalMilliseconds + "ms)");
                 }
                 catch (Exception retryEx)
                 {
@@ -686,7 +704,7 @@ namespace Nuvio
             // the new Initialized event delivers fresh swap-chain options.
             _player.SetVlcView(reloaded);
             var took = (long)(DateTime.UtcNow - started).TotalMilliseconds;
-            Log.Write("VLC video surface reloaded (stop=" + stopSeq + " epoch=" + epoch + " took=" + took + "ms)");
+            Log.Write("VLC video surface reloaded (reason=" + reason + " stop=" + stopSeq + " epoch=" + epoch + " took=" + took + "ms)");
         }
 
         private void VideoView_Initialized(object sender, InitializedEventArgs e)
