@@ -60,6 +60,11 @@ namespace Nuvio.Playback
         private double _confirmedPositionSeconds;
         private int _videoSizeSeekDone;
         private bool _videoSizeWasZero;
+        // Set by OnNaturalVideoSizeChanged, reset per open: the closest
+        // managed signal to "a first frame arrived" for this open. No
+        // frame-server API is used — enabling IsVideoFrameServerEnabled
+        // would change rendering.
+        private bool _naturalVideoSizeSeen;
         private int _pausedKickDone;
         private double _pausedKickPositionSeconds;
         private int _pausedKickElapsedSeconds;
@@ -238,6 +243,7 @@ namespace Nuvio.Playback
             _confirmedPositionSeconds = 0;
             _videoSizeSeekDone = 0;
             _videoSizeWasZero = false;
+            _naturalVideoSizeSeen = false;
             _confirmedGeneration = 0;
             _pausedKickDone = 0;
             _pausedKickPositionSeconds = 0;
@@ -531,19 +537,36 @@ namespace Nuvio.Playback
 
         // Runs on the UI thread (from the watchdog): session state,
         // buffering and download progress while the open is still waiting.
+        // Guarded: every read here is a COM call on the session, and in
+        // log 35 the player was torn down mid-watchdog twice — once as
+        // InvalidCastException, once as Shutdown 0xC00D3E85 — both
+        // thrown from inside this method. Uncaught, the exception
+        // escapes the dispatcher lambda and kills the whole watchdog
+        // (its catch is outside the tick loop), so a stuck open never
+        // reaches its 30s OpenTimeout failure. The guard logs the torn
+        // session instead and lets the watchdog tick on; the next tick
+        // exits cleanly once the generation moved or the player is gone.
+        // Diagnostic only; a torn session has no progress to report.
         private void LogOpenProgress(int elapsedSeconds)
         {
-            var session = _mediaPlayer == null ? null : _mediaPlayer.PlaybackSession;
-            if (session == null)
+            try
             {
-                Log.Write("FFmpeg open still waiting (" + elapsedSeconds + "s/" + (int)OpenTimeout.TotalSeconds + "s, no playback session)");
-                return;
+                var session = _mediaPlayer == null ? null : _mediaPlayer.PlaybackSession;
+                if (session == null)
+                {
+                    Log.Write("FFmpeg open still waiting (" + elapsedSeconds + "s/" + (int)OpenTimeout.TotalSeconds + "s, no playback session)");
+                    return;
+                }
+                Log.Write("FFmpeg open still waiting (" + elapsedSeconds + "s/" + (int)OpenTimeout.TotalSeconds + "s, state=" + session.PlaybackState +
+                    " size=" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight +
+                    " pos=" + Math.Round(session.Position.TotalSeconds) + "s" +
+                    " buffering=" + Math.Round(session.BufferingProgress * 100) + "%" +
+                    " download=" + Math.Round(session.DownloadProgress * 100) + "%)");
             }
-            Log.Write("FFmpeg open still waiting (" + elapsedSeconds + "s/" + (int)OpenTimeout.TotalSeconds + "s, state=" + session.PlaybackState +
-                " size=" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight +
-                " pos=" + Math.Round(session.Position.TotalSeconds) + "s" +
-                " buffering=" + Math.Round(session.BufferingProgress * 100) + "%" +
-                " download=" + Math.Round(session.DownloadProgress * 100) + "%)");
+            catch (Exception ex)
+            {
+                Log.Write("FFmpeg open still waiting (" + elapsedSeconds + "s/" + (int)OpenTimeout.TotalSeconds + "s, playback session unavailable: " + ex.GetType().Name + ")");
+            }
         }
 
         private bool IsCurrentOpen(long generation, CancellationToken token)
@@ -670,6 +693,44 @@ namespace Nuvio.Playback
             }
         }
 
+        // Diagnostic for the 0x0-size opens (log 35): at confirmation
+        // time, record what the source itself offers — video stream count
+        // and codecs from FFmpegInteropX, the session size, and whether
+        // a natural-size event ever fired for this open. That separates
+        // "no video stream in the source" (videoStreams=0) from "stream
+        // present but no frame ever sized" (streams>0, naturalSizeSeen
+        // false, session 0x0) from "a frame arrived then the size went
+        // away" (naturalSizeSeen true, session 0x0). Per-stream encoded
+        // dimensions are not read here: the VideoStreams API this code
+        // uses exposes codec/decoder only, and the MediaStreamSource
+        // descriptor route was not verified against the 2.1.0 surface,
+        // so it is deliberately left out rather than guessed. Never
+        // throws: any unreadable source logs its exception type instead.
+        private void LogVideoSourceInfo(string context, MediaPlaybackSession session)
+        {
+            try
+            {
+                var source = _ffmpegSource;
+                var count = source == null || source.VideoStreams == null ? 0 : source.VideoStreams.Count;
+                var codecs = string.Empty;
+                if (count > 0)
+                {
+                    foreach (var stream in source.VideoStreams)
+                    {
+                        if (codecs.Length > 0) codecs += ",";
+                        codecs += stream.CodecName ?? string.Empty;
+                    }
+                }
+                Log.Write("FFmpeg video source (" + context + "): videoStreams=" + count + " codecs=[" + codecs + "]" +
+                    " sessionSize=" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight +
+                    " naturalSizeSeen=" + _naturalVideoSizeSeen);
+            }
+            catch (Exception ex)
+            {
+                Log.Write("FFmpeg video source (" + context + "): could not read source info: " + ex.GetType().Name);
+            }
+        }
+
         // One-line memory snapshot for the heartbeat (every 3rd) and the
         // open baseline: app usage/limit/level from MemoryManager, plus
         // the open count, the number of MediaPlayers ever created, and
@@ -737,6 +798,16 @@ namespace Nuvio.Playback
 
         public void Stop()
         {
+            // Diagnostic for M-C (log 35): Stop() logged nothing at all,
+            // so a stale-page Dispose killing a new open was invisible in
+            // the log. The generation logged here is the open being killed
+            // (read before the increment); a later "Stop done" without a
+            // matching "entered" — or an "entered" without "done" — means
+            // Stop() threw part-way through. Diagnostic only; no behaviour
+            // change.
+            var killedGeneration = Interlocked.Read(ref _openGeneration);
+            var stopStarted = DateTime.UtcNow;
+            Log.Write("FFmpeg Stop entered (gen=" + killedGeneration + ")");
             Interlocked.Increment(ref _openGeneration);
             CancelPendingOpen();
             _openFailed = true;
@@ -744,6 +815,7 @@ namespace Nuvio.Playback
             if (_view != null) SetViewOpacity(0);
             ReleaseMediaPlayer();
             RaiseState("stopped", null);
+            Log.Write("FFmpeg Stop done (gen=" + killedGeneration + " took=" + Math.Round((DateTime.UtcNow - stopStarted).TotalMilliseconds) + "ms)");
         }
 
         public void SetPaused(bool paused) { if (_mediaPlayer != null) { if (paused) _mediaPlayer.Pause(); else _mediaPlayer.Play(); } }
@@ -1016,6 +1088,7 @@ namespace Nuvio.Playback
 
         private void OnNaturalVideoSizeChanged(MediaPlaybackSession sender, object args)
         {
+            _naturalVideoSizeSeen = true;
             SignalVideoReady(sender);
         }
 
@@ -1040,6 +1113,7 @@ namespace Nuvio.Playback
             CancelPendingOpen();
             Log.Write("FFmpeg video track ready (" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + ") constriction=" + ConstrictionReason(session));
             LogActualDecoder("ready");
+            LogVideoSourceInfo("ready", session);
             Raise("player.ready", new JsonObject());
             if (_view != null) SetViewOpacity(1);
         }
@@ -1067,6 +1141,7 @@ namespace Nuvio.Playback
                 " pos=" + Math.Round(session.Position.TotalSeconds) + "s" +
                 " size=" + session.NaturalVideoWidth + "x" + session.NaturalVideoHeight + ")");
             LogActualDecoder("playback-confirmed");
+            LogVideoSourceInfo("playback-confirmed", session);
             Raise("player.ready", new JsonObject());
             if (_view != null) SetViewOpacity(1);
             if (session.NaturalVideoWidth == 0 || session.NaturalVideoHeight == 0)
