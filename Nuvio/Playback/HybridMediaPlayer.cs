@@ -531,6 +531,12 @@ namespace Nuvio.Playback
                 return;
             }
             RaiseEngine("LibVLC", "FFmpeg could not play this source. Trying VLC…");
+            // G1: the primary may still be sounding after its failure path
+            // (OnMediaFailed detaches without pausing) — stop it explicitly
+            // so only VLC can sound after the fallback. This is the one
+            // path into OpenWithVlc that never stopped the primary: the
+            // forced-vlc and previously-failed branches both do.
+            try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg for a VLC fallback failed", ex); }
             OpenWithVlc(_currentRequest, _lastTimeSeconds, false);
         }
 
@@ -594,7 +600,10 @@ namespace Nuvio.Playback
             _active = ActiveEngine.None;
             _currentRequest = null;
             _pageId = null;
-            _primary.Stop();
+            // Each stop is guarded on its own: a throw in the FFmpeg stop
+            // used to skip the VLC stop below, leaving the other engine
+            // sounding after Stop() returned.
+            try { _primary.Stop(); } catch (Exception ex) { Log.Error("Stopping FFmpeg failed", ex); }
             if (_vlc != null)
             {
                 try { _vlc.Stop(); } catch (Exception ex) { Log.Error("Stopping VLC failed", ex); }

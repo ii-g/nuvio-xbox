@@ -699,6 +699,19 @@ namespace Nuvio.Playback
                 _wantPaused = false;
                 _wantAudioTrack = null;
                 _wantSpuTrack = null;
+                // M1: this load may have been superseded while the lambda
+                // waited (a later Open/Stop runs BeginTransition and bumps
+                // _loadSeq). Every event guard checks seq, but nothing
+                // checked it before playback itself — a stale open could
+                // sound with no events and no log trace. Bail without
+                // starting playback; the superseding flow owns the outcome,
+                // so no ReportStartFailure here (it would log a misleading
+                // start failure for a load that was cancelled, not failed).
+                if (seq != _loadSeq)
+                {
+                    Log.Write("VLC open superseded (seq=" + seq + ", current=" + _loadSeq + "); not starting playback");
+                    return;
+                }
                 if (!StartPlayback(request.StartSeconds, stopSettled))
                 {
                     ReportStartFailure(seq);
